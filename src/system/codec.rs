@@ -1,54 +1,46 @@
 use super::super::{Atom, Message};
+use super::Error;
 use super::Queue;
 
 use serde::Serialize;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Write};
+use std::marker::PhantomData;
 
-use futures::lock::Mutex;
-use std::sync::Arc;
-
-use bytes::*;
-use futures_codec::{Decoder, Encoder};
-
-use log::*;
+use std::sync::{Arc, Mutex};
 
 const MAX_MESSAGE_SIZE: usize = 128 * 1024;
 
-pub struct Codec<P, NP, R>
+pub struct Encoder<P, NP, R, IO>
 where
     P: Atom,
     NP: Atom,
     R: Atom,
+    IO: Write,
 {
+    phantom: PhantomData<(P, NP, R)>,
     buffer: Vec<u8>,
-    queue: Arc<Mutex<Queue<P, NP, R>>>,
+    write: IO,
 }
 
-impl<P, NP, R> Codec<P, NP, R>
+impl<P, NP, R, IO> Encoder<P, NP, R, IO>
 where
     P: Atom,
     NP: Atom,
     R: Atom,
+    IO: Write,
 {
-    pub fn new(queue: Arc<Mutex<Queue<P, NP, R>>>) -> Self {
+    pub fn new(write: IO) -> Self {
         let buffer: Vec<u8> = vec![0; MAX_MESSAGE_SIZE];
-        Self { buffer, queue }
+        Self {
+            write,
+            buffer,
+            phantom: PhantomData,
+        }
     }
-}
 
-impl<P, NP, R> Encoder for Codec<P, NP, R>
-where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
-{
-    type Item = Message<P, NP, R>;
-    type Error = std::io::Error;
+    pub fn encode(&mut self, item: Message<P, NP, R>) -> Result<(), Error> {
+        use std::io;
 
-    fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        use std::io::{self, Write};
-
-        // TODO: there's probably a way to do that without an additional buffer/copy
         let payload_slice = {
             let cursor = Cursor::new(&mut self.buffer[..]);
             let mut ser = rmp_serde::Serializer::new_named(cursor);
@@ -73,20 +65,48 @@ where
             &length_buffer[..written]
         };
 
-        let total_len = length_slice.len() + payload_slice.len();
-        debug!(
-            "encode ✔️ ({}, {})",
-            length_slice.len(),
-            payload_slice.len()
-        );
-        dst.resize(total_len, 0);
-        {
-            let mut cursor = Cursor::new(&mut dst[..total_len]);
-            cursor.write_all(length_slice)?;
-            cursor.write_all(payload_slice)?;
-        }
-
+        self.write.write_all(length_slice)?;
+        self.write.write_all(payload_slice)?;
         Ok(())
+    }
+}
+
+pub struct Decoder<P, NP, R, IO>
+where
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+    IO: Read,
+{
+    read: IO,
+    queue: Arc<Mutex<Queue<P, NP, R>>>,
+}
+
+impl<P, NP, R, IO> Decoder<P, NP, R, IO>
+where
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+    IO: Read,
+{
+    pub fn new(read: IO, queue: Arc<Mutex<Queue<P, NP, R>>>) -> Self {
+        Self { read, queue }
+    }
+
+    pub fn decode(&mut self) -> Result<Message<P, NP, R>, Error> {
+        use serde::de::Deserializer;
+        use std::io;
+
+        let mut deser = rmp_serde::Deserializer::new(&mut self.read);
+        // deserialize payload len
+        deser
+            .deserialize_u64(LengthVisitor {})
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let pr = self.queue.lock()?;
+        let payload = Message::<P, NP, R>::deserialize(&mut deser, &*pr)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(payload)
     }
 }
 
@@ -104,66 +124,5 @@ impl<'de> serde::de::Visitor<'de> for LengthVisitor {
         E: serde::de::Error,
     {
         Ok(value)
-    }
-}
-
-impl<P, NP, R> Decoder for Codec<P, NP, R>
-where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
-{
-    type Item = Message<P, NP, R>;
-    type Error = std::io::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        use serde::de::Deserializer;
-        use std::io;
-
-        if src.is_empty() {
-            debug!("decode ⏳ empty input");
-            return Ok(None);
-        }
-
-        let (len_len, payload_len) = {
-            let cursor = Cursor::new(&src[..]);
-            let mut deser = rmp_serde::Deserializer::new(cursor);
-            // FIXME: don't return error if we can't read the length,
-            // just say we need more
-            let payload_len = deser
-                .deserialize_u64(LengthVisitor {})
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-                as usize;
-            let cursor = deser.into_inner();
-            let len_len = cursor.position() as usize;
-            (len_len, payload_len)
-        };
-
-        let total_len = len_len + payload_len;
-        if src.len() < total_len {
-            // need more data
-            debug!(
-                "decode ⏳ ({}, {}), missing {}",
-                len_len,
-                payload_len,
-                total_len - src.len()
-            );
-            return Ok(None);
-        }
-        debug!("decode ✔️ ({}, {})", len_len, payload_len);
-
-        {
-            let cursor = Cursor::new(&src[len_len..total_len]);
-            let mut deser = rmp_serde::Deserializer::from_read(cursor);
-            if let Some(pr) = self.queue.try_lock() {
-                let payload = Self::Item::deserialize(&mut deser, &*pr)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                src.split_to(total_len);
-                Ok(Some(payload))
-            } else {
-                // FIXME: futures_codec doesn't really fit our usecase :(
-                panic!("could not acquire lock in decode");
-            }
-        }
     }
 }

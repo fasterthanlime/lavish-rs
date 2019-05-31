@@ -1,6 +1,3 @@
-
-use futures::task::SpawnError;
-
 #[derive(Debug)]
 pub enum Error {
     WrongResults,
@@ -9,8 +6,8 @@ pub enum Error {
     MethodUnimplemented(&'static str),
     RemoteError(String),
     TransportError(String),
-    SpawnError(SpawnError),
     InternalError(String),
+    IO(std::io::Error),
 }
 
 use std::fmt;
@@ -22,8 +19,26 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<SpawnError> for Error {
-    fn from(e: SpawnError) -> Self {
-        Error::SpawnError(e)
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(e: std::sync::PoisonError<T>) -> Self {
+        Error::InternalError(format!("sync error: {:#?}", e))
+    }
+}
+
+impl From<std::sync::mpsc::RecvError> for Error {
+    fn from(e: std::sync::mpsc::RecvError) -> Self {
+        Error::InternalError(format!("receive error: {:#?}", e))
+    }
+}
+
+impl<T> From<std::sync::mpsc::SendError<T>> for Error {
+    fn from(e: std::sync::mpsc::SendError<T>) -> Self {
+        Error::InternalError(format!("send error: {:#?}", e))
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::IO(e)
     }
 }

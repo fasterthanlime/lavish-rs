@@ -1,23 +1,22 @@
 use super::{Atom, Error, Message, PendingRequests};
 
-use std::marker::{PhantomData, Unpin};
-
-use futures::lock::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
-
-use futures::channel::{mpsc, oneshot};
-use futures::executor;
-use futures::prelude::*;
-use futures_codec::Framed;
-
-use futures::task::SpawnExt;
+use std::io::{self, Read, Write};
+use std::marker::PhantomData;
+use std::sync::{mpsc, Arc, Mutex};
 
 mod codec;
-use codec::Codec;
+use codec::{Decoder, Encoder};
 
-pub trait Conn: AsyncRead + AsyncWrite + Send + Sized + Unpin + 'static {}
-impl<T> Conn for T where T: AsyncRead + AsyncWrite + Send + Sized + Unpin + 'static {}
+pub trait Conn: Read + Write + Send + Sized + 'static {
+    fn try_clone(&self) -> io::Result<Self>;
+}
+
+impl Conn for std::net::TcpStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Protocol<P, NP, R>
@@ -43,25 +42,23 @@ where
     }
 }
 
-pub trait Handler<P, NP, R, FT>: Sync + Send
+pub trait Handler<P, NP, R>: Sync + Send
 where
     P: Atom,
     NP: Atom,
     R: Atom,
-    FT: Future<Output = Result<R, Error>> + Send + 'static,
 {
-    fn handle(&self, client: Client<P, NP, R>, params: P) -> FT;
+    fn handle(&self, client: Client<P, NP, R>, params: P) -> Result<R, Error>;
 }
 
-impl<P, NP, R, F, FT> Handler<P, NP, R, FT> for F
+impl<P, NP, R, F> Handler<P, NP, R> for F
 where
     P: Atom,
     R: Atom,
     NP: Atom,
-    F: (Fn(Client<P, NP, R>, P) -> FT) + Send + Sync,
-    FT: Future<Output = Result<R, Error>> + Send + 'static,
+    F: (Fn(Client<P, NP, R>, P) -> Result<R, Error>) + Send + Sync,
 {
-    fn handle(&self, client: Client<P, NP, R>, params: P) -> FT {
+    fn handle(&self, client: Client<P, NP, R>, params: P) -> Result<R, Error> {
         self(client, params)
     }
 }
@@ -89,39 +86,35 @@ where
         }
     }
 
-    #[allow(clippy::needless_lifetimes)]
-    pub async fn call_raw(
-        &self,
-        params: P,
-    ) -> Result<Message<P, NP, R>, Box<dyn std::error::Error>> {
+    pub fn call_raw(&self, params: P) -> Result<Message<P, NP, R>, Error> {
         let id = {
-            let mut queue = self.queue.lock().await;
+            let mut queue = self.queue.lock()?;
             queue.next_id()
         };
 
         let method = params.method();
         let m = Message::Request { id, params };
 
-        let (tx, rx) = oneshot::channel::<Message<P, NP, R>>();
+        let (tx, rx) = mpsc::channel::<Message<P, NP, R>>();
         let in_flight = InFlightRequest { method, tx };
         {
-            let mut queue = self.queue.lock().await;
+            let mut queue = self.queue.lock()?;
             queue.in_flight_requests.insert(id, in_flight);
         }
 
         {
-            let mut sink = self.sink.clone();
-            sink.send(m).await?;
+            let sink = self.sink.clone();
+            sink.send(m)?;
         }
-        Ok(rx.await?)
+        Ok(rx.recv()?)
     }
 
     #[allow(clippy::needless_lifetimes)]
-    pub async fn call<D, RR>(&self, params: P, downgrade: D) -> Result<RR, Error>
+    pub fn call<D, RR>(&self, params: P, downgrade: D) -> Result<RR, Error>
     where
         D: Fn(R) -> Option<RR>,
     {
-        match self.call_raw(params).await {
+        match self.call_raw(params) {
             Ok(m) => match m {
                 Message::Response { results, error, .. } => {
                     if let Some(error) = error {
@@ -139,26 +132,25 @@ where
     }
 }
 
-pub fn connect<C, H, FT, P, NP, R>(
+pub fn connect<C, H, P, NP, R>(
     protocol: Protocol<P, NP, R>,
     handler: H,
     io: C,
-    mut pool: executor::ThreadPool,
 ) -> Result<Client<P, NP, R>, Error>
 where
     C: Conn,
-    H: Handler<P, NP, R, FT> + 'static,
-    FT: Future<Output = Result<R, Error>> + Send + 'static,
+    H: Handler<P, NP, R> + 'static,
     P: Atom,
     NP: Atom,
     R: Atom,
 {
     let queue = Arc::new(Mutex::new(Queue::new(protocol)));
 
-    let codec = Codec::new(queue.clone());
-    let framed = Framed::new(io, codec);
-    let (mut sink, mut stream) = framed.split();
-    let (tx, mut rx) = mpsc::channel(128);
+    let write = io.try_clone()?;
+    let read = io;
+    let mut decoder = Decoder::new(read, queue.clone());
+    let mut encoder = Encoder::new(write);
+    let (tx, rx) = mpsc::channel();
 
     let client = Client::<P, NP, R> {
         queue: queue.clone(),
@@ -167,42 +159,52 @@ where
 
     let ret = client.clone();
 
-    pool.clone().spawn(async move {
-        while let Some(m) = rx.next().await {
-            sink.send(m).await.unwrap();
+    // TODO: shutdown handling
+    std::thread::spawn(move || {
+        // FIXME: error handling
+        loop {
+            let m = rx.recv().unwrap();
+            encoder.encode(m).unwrap();
         }
-    })?;
+    });
 
-    pool.clone()
-        .spawn(async move {
-            let handler = Arc::new(handler);
+    // TODO: shutdown handling
+    std::thread::spawn(move || {
+        let handler = Arc::new(handler);
 
-            while let Some(m) = stream.next().await {
-                let res = m.map(|m| pool.spawn(handle_message(m, handler.clone(), client.clone())));
+        // FIXME: error handling
+        loop {
+            let m = decoder.decode().unwrap();
+            let handler = handler.clone();
+            let client = client.clone();
+
+            std::thread::spawn(move || {
+                // TODO: error handling
+                let res = handle_message(m, handler, client);
                 if let Err(e) = res {
                     eprintln!("message stream error: {:#?}", e);
                 }
-            }
-        })
-        .map_err(Error::SpawnError)?;
+            });
+        }
+    });
 
     Ok(ret)
 }
 
-async fn handle_message<P, NP, R, H, FT>(
+fn handle_message<P, NP, R, H>(
     inbound: Message<P, NP, R>,
     handler: Arc<H>,
-    mut client: Client<P, NP, R>,
-) where
+    client: Client<P, NP, R>,
+) -> Result<(), Error>
+where
     P: Atom,
     NP: Atom,
     R: Atom,
-    H: Handler<P, NP, R, FT>,
-    FT: Future<Output = Result<R, Error>> + Send + 'static,
+    H: Handler<P, NP, R>,
 {
     match inbound {
         Message::Request { id, params } => {
-            let m = match handler.handle(client.clone(), params).await {
+            let m = match handler.handle(client.clone(), params) {
                 Ok(results) => Message::Response::<P, NP, R> {
                     id,
                     results: Some(results),
@@ -214,11 +216,11 @@ async fn handle_message<P, NP, R, H, FT>(
                     error: Some(format!("internal error: {:#?}", error)),
                 },
             };
-            client.sink.send(m).await.unwrap();
+            client.sink.send(m).unwrap();
         }
         Message::Response { id, error, results } => {
             if let Some(in_flight) = {
-                let mut queue = client.queue.lock().await;
+                let mut queue = client.queue.lock()?;
                 queue.in_flight_requests.remove(&id)
             } {
                 in_flight
@@ -229,6 +231,7 @@ async fn handle_message<P, NP, R, H, FT>(
         }
         Message::Notification { .. } => unimplemented!(),
     };
+    Ok(())
 }
 
 struct InFlightRequest<P, NP, R>
@@ -238,7 +241,7 @@ where
     R: Atom,
 {
     method: &'static str,
-    tx: oneshot::Sender<Message<P, NP, R>>,
+    tx: mpsc::Sender<Message<P, NP, R>>,
 }
 
 pub struct Queue<P, NP, R>
