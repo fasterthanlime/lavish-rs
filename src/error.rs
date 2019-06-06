@@ -1,6 +1,7 @@
 #[derive(Debug)]
 pub enum Error {
     WrongResults,
+    WrongParams,
     MissingResults,
     WrongMessageType,
     MethodUnimplemented(&'static str),
