@@ -5,12 +5,14 @@ authors = ["Amos Wenger <amoswenger@gmail.com>"]
 edition = "2018"
 description = "RPC runtime for Lavish"
 repository = "https://github.com/lavish-lang/lavish-rs"
+readme = "README.md"
 license = "MIT"
 
 keywords = ["rpc", "msgpack", "ipc", "lavish"]
 categories = ["network-programming", "encoding"]
 
 [badges]
+travis-ci = { repository = "lavish-lang/lavish-rs" }
 maintenance = { status = "experimental" }
 
 [dependencies]
