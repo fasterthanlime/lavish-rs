@@ -13,14 +13,15 @@ use log::*;
 mod codec;
 use codec::{Decoder, Encoder};
 
-pub trait Conn: Read + Write + Send + Sized + 'static {
-    fn try_clone(&self) -> io::Result<Self>;
+pub trait Conn: Read + Write + Send + Sync + 'static {
+    fn try_clone(&self) -> io::Result<Box<Conn>>;
     fn shutdown(&self, how: Shutdown) -> io::Result<()>;
 }
 
 impl Conn for std::net::TcpStream {
-    fn try_clone(&self) -> io::Result<Self> {
-        self.try_clone()
+    fn try_clone(&self) -> io::Result<Box<Conn>> {
+        let other = self.try_clone()?;
+        Ok(Box::new(other))
     }
 
     fn shutdown(&self, how: Shutdown) -> io::Result<()> {
@@ -56,6 +57,7 @@ where
     NP: Atom,
     R: Atom,
 {
+    conn_ref: Arc<ConnRef>,
     queue: Arc<Mutex<Queue<P, NP, R>>>,
     sink: mpsc::Sender<SinkValue<P, NP, R>>,
 }
@@ -68,6 +70,7 @@ where
 {
     fn clone(&self) -> Self {
         Caller {
+            conn_ref: self.conn_ref.clone(),
             queue: self.queue.clone(),
             sink: self.sink.clone(),
         }
@@ -135,7 +138,7 @@ pub fn default_timeout() -> Duration {
 pub fn connect_tcp<AH, H, CL, P, NP, R>(
     handler: AH,
     addr: &SocketAddr,
-) -> Result<Runtime<TcpStream, CL>, Error>
+) -> Result<Runtime<CL>, Error>
 where
     AH: Into<Arc<H>>,
     H: Handler<CL, P, NP, R> + 'static,
@@ -145,23 +148,21 @@ where
     R: Atom,
 {
     let conn = TcpStream::connect_timeout(addr, default_timeout())?;
-    return spawn(handler, conn);
+    return spawn(handler, Box::new(conn));
 }
 
-pub struct Runtime<C, CL>
+pub struct Runtime<CL>
 where
-    C: Conn,
     CL: Clone,
 {
     client_template: CL,
     encode_handle: Option<JoinHandle<()>>,
     decode_handle: Option<JoinHandle<()>>,
-    shutdown_handle: C,
+    shutdown_handle: Box<Conn>,
 }
 
-impl<C, CL> Runtime<C, CL>
+impl<CL> Runtime<CL>
 where
-    C: Conn,
     CL: Clone,
 {
     pub fn join(&mut self) -> Result<(), Box<dyn Any + Send>> {
@@ -179,26 +180,30 @@ where
     }
 
     pub fn shutdown(&self) {
-        debug!("Runtime: shutting down conn");
+        debug!("Runtime: explicit shutdown requested");
         self.shutdown_handle.shutdown(Shutdown::Both).ok();
-        debug!("Runtime: conn was shut down (both sides)");
     }
 }
 
-impl<C, CL> Drop for Runtime<C, CL>
-where
-    C: Conn,
-    CL: Clone,
-{
+struct ConnRef {
+    conn: Box<Conn>,
+}
+
+impl ConnRef {
+    fn shutdown(&self) {
+        debug!("ConnRef: dropping, shutting down connection");
+        self.conn.shutdown(Shutdown::Both).ok();
+    }
+}
+
+impl Drop for ConnRef {
     fn drop(&mut self) {
-        debug!("Runtime dropped!");
         self.shutdown();
     }
 }
 
-pub fn spawn<C, CL, AH, H, P, NP, R>(handler: AH, conn: C) -> Result<Runtime<C, CL>, Error>
+pub fn spawn<CL, AH, H, P, NP, R>(handler: AH, conn: Box<Conn>) -> Result<Runtime<CL>, Error>
 where
-    C: Conn,
     CL: Clone,
     AH: Into<Arc<H>>,
     H: Handler<CL, P, NP, R> + 'static,
@@ -208,11 +213,13 @@ where
 {
     let handler = handler.into();
     let queue = Arc::new(Mutex::new(Queue::new()));
+    let conn_ref = Arc::new(ConnRef {
+        conn: conn.try_clone()?,
+    });
 
     let shutdown_handle = conn.try_clone()?;
-    let encoder_shutdown_handle = conn.try_clone()?;
-    let decoder_shutdown_handle = conn.try_clone()?;
-
+    let encode_shutdown_handle = conn.try_clone()?;
+    let decode_shutdown_handle = conn.try_clone()?;
     let write = conn.try_clone()?;
     let read = conn;
     let mut decoder = Decoder::new(read, queue.clone());
@@ -220,12 +227,13 @@ where
     let (tx, rx) = mpsc::channel();
     let runtime_tx = tx.clone();
 
-    let client = Caller::<P, NP, R> {
+    let caller = Caller::<P, NP, R> {
+        conn_ref: conn_ref.clone(),
         queue: queue.clone(),
         sink: tx,
     };
 
-    let client_template = H::make_client(client.clone());
+    let client_template = H::make_client(caller.clone());
 
     let encode_queue = queue.clone();
     let encode_handle = std::thread::spawn(move || {
@@ -256,7 +264,7 @@ where
         }
 
         debug!("Encoder thread watcher: shutting down conn");
-        encoder_shutdown_handle.shutdown(Shutdown::Both).ok();
+        encode_shutdown_handle.shutdown(Shutdown::Both).ok();
 
         debug!("Encoder thread watcher: cancelling pending requests");
         let queue = encode_queue.lock().unwrap();
@@ -282,10 +290,10 @@ where
                 Ok(res) => match res {
                     Some(message) => {
                         let handler = handler.clone();
-                        let client = client.clone();
+                        let caller = caller.clone();
 
                         std::thread::spawn(move || {
-                            let res = handle_message(message, handler, client);
+                            let res = handle_message(message, handler, caller);
                             if let Err(e) = res {
                                 eprintln!("message stream error: {:#?}", e);
                             }
@@ -305,7 +313,7 @@ where
         runtime_tx.send(SinkValue::Shutdown).ok();
 
         debug!("Decoder thread watcher: shutting down conn");
-        decoder_shutdown_handle.shutdown(Shutdown::Both).ok();
+        decode_shutdown_handle.shutdown(Shutdown::Both).ok();
 
         debug!("Decoder thread watcher: done");
     });
@@ -322,7 +330,7 @@ where
 fn handle_message<P, NP, R, H, CL>(
     inbound: Message<P, NP, R>,
     handler: Arc<H>,
-    client: Caller<P, NP, R>,
+    caller: Caller<P, NP, R>,
 ) -> Result<(), Error>
 where
     P: Atom,
@@ -333,7 +341,7 @@ where
 {
     match inbound {
         Message::Request { id, params } => {
-            let m = match handler.handle(client.clone(), params) {
+            let m = match handler.handle(caller.clone(), params) {
                 Ok(results) => Message::Response::<P, NP, R> {
                     id,
                     results: Some(results),
@@ -345,11 +353,11 @@ where
                     error: Some(format!("internal error: {:#?}", error)),
                 },
             };
-            client.sink.send(SinkValue::Message(m))?;
+            caller.sink.send(SinkValue::Message(m))?;
         }
         Message::Response { id, error, results } => {
             if let Some(in_flight) = {
-                let mut queue = client.queue.lock()?;
+                let mut queue = caller.queue.lock()?;
                 queue.in_flight_requests.remove(&id)
             } {
                 in_flight
