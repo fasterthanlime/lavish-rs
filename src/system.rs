@@ -60,7 +60,7 @@ where
     sink: mpsc::Sender<SinkValue<P, NP, R>>,
 }
 
-impl<P, NP, R> Caller<P, NP, R>
+impl<P, NP, R> Clone for Caller<P, NP, R>
 where
     P: Atom,
     NP: Atom,
@@ -72,7 +72,14 @@ where
             sink: self.sink.clone(),
         }
     }
+}
 
+impl<P, NP, R> Caller<P, NP, R>
+where
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
     pub fn call_raw(&self, params: P) -> Result<Message<P, NP, R>, Error> {
         let id = {
             let mut queue = self.queue.lock()?;
