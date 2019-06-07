@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use log::*;
@@ -157,7 +158,8 @@ where
     R: Atom,
 {
     proto_client: Client<P, NP, R>,
-    err_rx: mpsc::Receiver<Result<(), Box<dyn Any + Send>>>,
+    encode_handle: Option<JoinHandle<()>>,
+    decode_handle: Option<JoinHandle<()>>,
     shutdown_handle: C,
 }
 
@@ -168,38 +170,24 @@ where
     NP: Atom,
     R: Atom,
 {
-    pub fn join(&self) -> Result<(), Box<dyn Any + Send>> {
-        debug!("Runtime.join: res1: receiving...");
-        let res1 = self.err_rx.recv().unwrap();
-        if let Err(e) = res1.as_ref() {
-            warn!("While joining: {:#?}", e);
+    pub fn join(&mut self) -> Result<(), Box<dyn Any + Send>> {
+        if let Some(h) = self.encode_handle.take() {
+            h.join()?;
         }
-        debug!("Runtime.join: res1: received.");
-        debug!("Runtime.join: res2: receiving...");
-        let res2 = self.err_rx.recv().unwrap();
-        if let Err(e) = res2.as_ref() {
-            warn!("While joining: {:#?}", e);
+        if let Some(h) = self.decode_handle.take() {
+            h.join()?;
         }
-        debug!("Runtime.join: res2: received.");
-
-        match res1 {
-            Err(e) => return Err(e),
-            _ => match res2 {
-                Err(e) => return Err(e),
-                _ => Ok(()),
-            },
-        }
+        Ok(())
     }
 
     pub fn client(&self) -> Client<P, NP, R> {
         self.proto_client.clone()
     }
 
-    pub fn shutdown(&self) -> Result<(), Error> {
+    pub fn shutdown(&self) {
         debug!("Runtime: shutting down conn");
-        self.shutdown_handle.shutdown(Shutdown::Both)?;
+        self.shutdown_handle.shutdown(Shutdown::Both).ok();
         debug!("Runtime: conn was shut down (both sides)");
-        Ok(())
     }
 }
 
@@ -212,7 +200,7 @@ where
 {
     fn drop(&mut self) {
         debug!("Runtime dropped!");
-        self.shutdown().unwrap();
+        self.shutdown();
     }
 }
 
@@ -230,6 +218,8 @@ where
 
     let shutdown_handle = conn.try_clone()?;
     let encoder_shutdown_handle = conn.try_clone()?;
+    let decoder_shutdown_handle = conn.try_clone()?;
+
     let write = conn.try_clone()?;
     let read = conn;
     let mut decoder = Decoder::new(read, queue.clone());
@@ -243,41 +233,38 @@ where
     };
 
     let proto_client = client.clone();
-    let (err_tx, err_rx) = mpsc::channel();
-    let err_tx2 = err_tx.clone();
-
-    let encode_handle = std::thread::spawn(move || loop {
-        match rx.recv() {
-            Ok(val) => {
-                debug!("Encoder thread: received {:#?}", val);
-                match val {
-                    SinkValue::Message(m) => {
-                        if let Err(e) = encoder.encode(m) {
-                            debug!("Encoder thread: could not encode: {:#?}", e);
-                            debug!("Encoder thread: shutting down conn");
-                            encoder_shutdown_handle.shutdown(Shutdown::Both).ok();
-                            return;
-                        }
-                    }
-                    SinkValue::Shutdown => {
-                        debug!("Encoder thread: received shutdown");
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("Encoder thread: all senders dropped");
-                debug!("Encoder thread: error was: {:#?}", e);
-                return;
-            }
-        }
-    });
 
     let encode_queue = queue.clone();
-    std::thread::spawn(move || {
-        // if we can't send it it's because Runtime has been dropped,
-        // no big deal.
-        err_tx.send(encode_handle.join()).ok();
+    let encode_handle = std::thread::spawn(move || {
+        'relay: loop {
+            match rx.recv() {
+                Ok(val) => {
+                    debug!("Encoder thread: received {:#?}", val);
+                    match val {
+                        SinkValue::Message(m) => {
+                            if let Err(e) = encoder.encode(m) {
+                                debug!("Encoder thread: could not encode: {:#?}", e);
+                                debug!("Encoder thread: breaking");
+                                break 'relay;
+                            }
+                        }
+                        SinkValue::Shutdown => {
+                            debug!("Encoder thread: received shutdown");
+                            break 'relay;
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Encoder thread: could not receive");
+                    debug!("Encoder thread: error was: {:#?}", e);
+                    break 'relay;
+                }
+            }
+        }
+
+        debug!("Encoder thread watcher: shutting down conn");
+        encoder_shutdown_handle.shutdown(Shutdown::Both).ok();
+
         debug!("Encoder thread watcher: cancelling pending requests");
         let queue = encode_queue.lock().unwrap();
         for (k, v) in &queue.in_flight_requests {
@@ -291,42 +278,51 @@ where
         debug!("Encoder thread watcher: done");
     });
 
-    let decode_handle = std::thread::spawn(move || loop {
-        let res = decoder.decode().unwrap();
-        match res {
-            Some(message) => {
-                let handler = handler.clone();
-                let client = client.clone();
+    let decode_handle = std::thread::spawn(move || {
+        'relay: loop {
+            match decoder.decode() {
+                Err(e) => {
+                    debug!("Decode thread: could not decode: {:#?}", e);
+                    debug!("Decode thread: breaking");
+                    break 'relay;
+                }
+                Ok(res) => match res {
+                    Some(message) => {
+                        let handler = handler.clone();
+                        let client = client.clone();
 
-                std::thread::spawn(move || {
-                    let res = handle_message(message, handler, client);
-                    if let Err(e) = res {
-                        eprintln!("message stream error: {:#?}", e);
+                        std::thread::spawn(move || {
+                            let res = handle_message(message, handler, client);
+                            if let Err(e) = res {
+                                eprintln!("message stream error: {:#?}", e);
+                            }
+                        });
                     }
-                });
-            }
-            None => {
-                // Signals EOF, we're done here
-                debug!("Decode thread: received None value, end of stream");
-                debug!("Decode thread: sending shutdown to encode thread");
-                runtime_tx.send(SinkValue::Shutdown).ok();
-                debug!("Decode thread: returning");
-                return;
+                    None => {
+                        // Signals EOF, we're done here
+                        debug!("Decode thread: received None value, end of stream");
+                        debug!("Decode thread: breaking");
+                        break 'relay;
+                    }
+                },
             }
         }
-    });
-    std::thread::spawn(move || {
-        // if we can't send it it's because Runtime has been dropped,
-        // no big deal.
-        err_tx2.send(decode_handle.join()).ok();
+
+        debug!("Decoder thread watcher: sending shutdown to encode thread");
+        runtime_tx.send(SinkValue::Shutdown).ok();
+
+        debug!("Decoder thread watcher: shutting down conn");
+        decoder_shutdown_handle.shutdown(Shutdown::Both).ok();
+
         debug!("Decoder thread watcher: done");
     });
 
     debug!("Spawned runtime!");
     Ok(Runtime {
         proto_client,
-        err_rx,
         shutdown_handle,
+        encode_handle: Some(encode_handle),
+        decode_handle: Some(decode_handle),
     })
 }
 
