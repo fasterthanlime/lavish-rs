@@ -3,7 +3,7 @@ use super::{Atom, Error, Message, PendingRequests};
 use std::any::Any;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -133,12 +133,9 @@ pub fn default_timeout() -> Duration {
     Duration::from_secs(2)
 }
 
-// Connect to a TCP address, then spawn a new RPC
+// Connect to an address over TCP, then spawn a new RPC
 // system with the given handler
-pub fn connect_tcp<AH, H, CL, P, NP, R>(
-    handler: AH,
-    addr: &SocketAddr,
-) -> Result<Runtime<CL>, Error>
+pub fn connect<AH, H, CL, P, NP, R>(handler: AH, addr: &SocketAddr) -> Result<Runtime<CL>, Error>
 where
     AH: Into<Arc<H>>,
     H: Handler<CL, P, NP, R> + 'static,
@@ -149,6 +146,54 @@ where
 {
     let conn = TcpStream::connect_timeout(addr, default_timeout())?;
     return spawn(handler, Box::new(conn));
+}
+
+pub fn listen<AH, H, CL, P, NP, R>(handler: AH, addr: &SocketAddr) -> Result<JoinHandle<()>, Error>
+where
+    AH: Into<Arc<H>>,
+    H: Handler<CL, P, NP, R> + 'static,
+    CL: Clone,
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
+    listen_with_max_conns(handler, addr, None)
+}
+
+pub fn listen_with_max_conns<AH, H, CL, P, NP, R>(
+    handler: AH,
+    addr: &SocketAddr,
+    max_conns: Option<usize>,
+) -> Result<JoinHandle<()>, Error>
+where
+    AH: Into<Arc<H>>,
+    H: Handler<CL, P, NP, R> + 'static,
+    CL: Clone,
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
+    let handler = handler.into();
+    let listener = TcpListener::bind(addr)?;
+
+    let join_handle = std::thread::spawn(move || {
+        let mut conn_number = 0;
+        let mut incoming = listener.incoming();
+        while let Some(conn) = incoming.next() {
+            let conn = conn.unwrap();
+            let handler = handler.clone();
+            // oh poor rustc you needed a little push there
+            spawn::<CL, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap();
+
+            conn_number += 1;
+            if let Some(max_conns) = max_conns {
+                if conn_number >= max_conns {
+                    return;
+                }
+            }
+        }
+    });
+    Ok(join_handle)
 }
 
 pub struct Runtime<CL>
