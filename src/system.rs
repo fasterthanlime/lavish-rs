@@ -177,7 +177,22 @@ where
     return spawn(handler, Box::new(conn));
 }
 
-pub fn serve<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<JoinHandle<()>, Error>
+pub struct Server {
+    join_handle: JoinHandle<()>,
+    local_addr: SocketAddr,
+}
+
+impl Server {
+    pub fn join(self) -> Result<(), Box<dyn Any + Send + 'static>> {
+        self.join_handle.join()
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+pub fn serve<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Server, Error>
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
@@ -190,7 +205,7 @@ where
     serve_max_conns(handler, addr, None)
 }
 
-pub fn serve_once<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<JoinHandle<()>, Error>
+pub fn serve_once<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Server, Error>
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
@@ -207,7 +222,7 @@ pub fn serve_max_conns<AH, A, H, CL, P, NP, R>(
     handler: AH,
     addr: A,
     max_conns: Option<usize>,
-) -> Result<JoinHandle<()>, Error>
+) -> Result<Server, Error>
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
@@ -219,6 +234,7 @@ where
 {
     let handler = handler.into();
     let listener = TcpListener::bind(addr)?;
+    let local_addr = listener.local_addr()?;
 
     let join_handle = std::thread::spawn(move || {
         let mut conn_number = 0;
@@ -238,7 +254,10 @@ where
             }
         }
     });
-    Ok(join_handle)
+    Ok(Server {
+        join_handle,
+        local_addr,
+    })
 }
 
 pub struct Runtime<CL>
