@@ -169,10 +169,12 @@ where
     R: Atom,
 {
     pub fn join(&self) -> Result<(), Box<dyn Any + Send>> {
+        debug!("Runtime.join: receiving first error");
         let res1 = self.err_rx.recv().unwrap();
         if let Err(e) = res1.as_ref() {
             warn!("While joining: {:#?}", e);
         }
+        debug!("Runtime.join: receiving second error");
         let res2 = self.err_rx.recv().unwrap();
         if let Err(e) = res2.as_ref() {
             warn!("While joining: {:#?}", e);
@@ -194,7 +196,21 @@ where
     pub fn shutdown(&self) -> Result<(), Error> {
         debug!("Runtime: shutting down ");
         self.shutdown_handle.shutdown(Shutdown::Both)?;
+        debug!("Runtime: did shut down both sides of conn");
         Ok(())
+    }
+}
+
+impl<C, P, NP, R> Drop for Runtime<C, P, NP, R>
+where
+    C: Conn,
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
+    fn drop(&mut self) {
+        debug!("Runtime dropped!");
+        self.shutdown().unwrap();
     }
 }
 
@@ -227,36 +243,58 @@ where
     let err_tx2 = err_tx.clone();
 
     let encode_handle = std::thread::spawn(move || loop {
-        match rx.recv().unwrap() {
-            SinkValue::Message(m) => {
-                encoder.encode(m).unwrap();
-            }
-            SinkValue::Shutdown => {
-                debug!("Encoder loop: dropping receiver");
+        match rx.recv() {
+            Ok(val) => match val {
+                SinkValue::Message(m) => {
+                    encoder.encode(m).unwrap();
+                }
+                SinkValue::Shutdown => {
+                    debug!("Encoder thread: received shutdown");
+                    return;
+                }
+            },
+            Err(e) => {
+                debug!("Encoder thread: all senders dropped");
+                debug!("Encoder thread: error was: {:#?}", e);
                 return;
             }
         }
     });
     std::thread::spawn(move || {
-        err_tx.send(encode_handle.join()).unwrap();
+        // if we can't send it it's because Runtime has been dropped,
+        // no big deal.
+        err_tx.send(encode_handle.join()).ok();
+        debug!("Encoder thread watcher: done");
     });
 
     let decode_handle = std::thread::spawn(move || loop {
-        let m = decoder.decode().unwrap();
-        let handler = handler.clone();
-        let client = client.clone();
+        let res = decoder.decode().unwrap();
+        match res {
+            Some(message) => {
+                let handler = handler.clone();
+                let client = client.clone();
 
-        std::thread::spawn(move || {
-            let res = handle_message(m, handler, client);
-            if let Err(e) = res {
-                eprintln!("message stream error: {:#?}", e);
+                std::thread::spawn(move || {
+                    let res = handle_message(message, handler, client);
+                    if let Err(e) = res {
+                        eprintln!("message stream error: {:#?}", e);
+                    }
+                });
             }
-        });
+            None => {
+                // Signals EOF, we're done here
+                return;
+            }
+        }
     });
     std::thread::spawn(move || {
-        err_tx2.send(decode_handle.join()).unwrap();
+        // if we can't send it it's because Runtime has been dropped,
+        // no big deal.
+        err_tx2.send(decode_handle.join()).ok();
+        debug!("Decoder thread watcher: done");
     });
 
+    debug!("Spawned runtime!");
     Ok(Runtime {
         proto_client,
         err_rx,

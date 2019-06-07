@@ -8,6 +8,8 @@ use std::marker::PhantomData;
 
 use std::sync::{Arc, Mutex};
 
+use log::*;
+
 const MAX_MESSAGE_SIZE: usize = 128 * 1024;
 
 pub struct Encoder<P, NP, R, IO>
@@ -97,20 +99,31 @@ where
         Self { read, queue }
     }
 
-    pub fn decode(&mut self) -> Result<Message<P, NP, R>, Error> {
+    pub fn decode(&mut self) -> Result<Option<Message<P, NP, R>>, Error> {
         use serde::de::Deserializer;
+        use std::error::Error;
         use std::io;
 
         let mut deser = rmp_serde::Deserializer::new(&mut self.read);
         // deserialize payload len
-        deser
-            .deserialize_u64(LengthVisitor {})
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        match deser.deserialize_u64(LengthVisitor {}) {
+            Err(e) => {
+                match &e {
+                    rmp_serde::decode::Error::InvalidMarkerRead(e) => match e.kind() {
+                        std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                        _ => {}
+                    },
+                    _ => {}
+                };
+                return Err(io::Error::new(io::ErrorKind::Other, e).into());
+            }
+            Ok(_) => {}
+        };
 
         let pr = self.queue.lock()?;
         let payload = Message::<P, NP, R>::deserialize(&mut deser, &*pr)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        Ok(payload)
+        Ok(Some(payload))
     }
 }
 
