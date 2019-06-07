@@ -28,25 +28,15 @@ impl Conn for std::net::TcpStream {
     }
 }
 
-pub trait Handler<P, NP, R>: Sync + Send
+pub trait Handler<CL, P, NP, R>: Sync + Send
 where
+    CL: Clone,
     P: Atom,
     NP: Atom,
     R: Atom,
 {
-    fn handle(&self, client: Client<P, NP, R>, params: P) -> Result<R, Error>;
-}
-
-impl<P, NP, R, F> Handler<P, NP, R> for F
-where
-    P: Atom,
-    R: Atom,
-    NP: Atom,
-    F: (Fn(Client<P, NP, R>, P) -> Result<R, Error>) + Send + Sync,
-{
-    fn handle(&self, client: Client<P, NP, R>, params: P) -> Result<R, Error> {
-        self(client, params)
-    }
+    fn handle(&self, client: Caller<P, NP, R>, params: P) -> Result<R, Error>;
+    fn make_client(client: Caller<P, NP, R>) -> CL;
 }
 
 #[derive(Debug)]
@@ -60,7 +50,7 @@ where
     Message(Message<P, NP, R>),
 }
 
-pub struct Client<P, NP, R>
+pub struct Caller<P, NP, R>
 where
     P: Atom,
     NP: Atom,
@@ -70,14 +60,14 @@ where
     sink: mpsc::Sender<SinkValue<P, NP, R>>,
 }
 
-impl<P, NP, R> Client<P, NP, R>
+impl<P, NP, R> Caller<P, NP, R>
 where
     P: Atom,
     NP: Atom,
     R: Atom,
 {
     fn clone(&self) -> Self {
-        Client {
+        Caller {
             queue: self.queue.clone(),
             sink: self.sink.clone(),
         }
@@ -135,13 +125,14 @@ pub fn default_timeout() -> Duration {
 
 // Connect to a TCP address, then spawn a new RPC
 // system with the given handler
-pub fn connect_tcp<AH, H, P, NP, R>(
+pub fn connect_tcp<AH, H, CL, P, NP, R>(
     handler: AH,
     addr: &SocketAddr,
-) -> Result<Runtime<TcpStream, P, NP, R>, Error>
+) -> Result<Runtime<TcpStream, CL>, Error>
 where
     AH: Into<Arc<H>>,
-    H: Handler<P, NP, R> + 'static,
+    H: Handler<CL, P, NP, R> + 'static,
+    CL: Clone,
     P: Atom,
     NP: Atom,
     R: Atom,
@@ -150,25 +141,21 @@ where
     return spawn(handler, conn);
 }
 
-pub struct Runtime<C, P, NP, R>
+pub struct Runtime<C, CL>
 where
     C: Conn,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    CL: Clone,
 {
-    proto_client: Client<P, NP, R>,
+    client_template: CL,
     encode_handle: Option<JoinHandle<()>>,
     decode_handle: Option<JoinHandle<()>>,
     shutdown_handle: C,
 }
 
-impl<C, P, NP, R> Runtime<C, P, NP, R>
+impl<C, CL> Runtime<C, CL>
 where
     C: Conn,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    CL: Clone,
 {
     pub fn join(&mut self) -> Result<(), Box<dyn Any + Send>> {
         if let Some(h) = self.encode_handle.take() {
@@ -180,8 +167,8 @@ where
         Ok(())
     }
 
-    pub fn client(&self) -> Client<P, NP, R> {
-        self.proto_client.clone()
+    pub fn client(&self) -> CL {
+        self.client_template.clone()
     }
 
     pub fn shutdown(&self) {
@@ -191,12 +178,10 @@ where
     }
 }
 
-impl<C, P, NP, R> Drop for Runtime<C, P, NP, R>
+impl<C, CL> Drop for Runtime<C, CL>
 where
     C: Conn,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    CL: Clone,
 {
     fn drop(&mut self) {
         debug!("Runtime dropped!");
@@ -204,11 +189,12 @@ where
     }
 }
 
-pub fn spawn<C, AH, H, P, NP, R>(handler: AH, conn: C) -> Result<Runtime<C, P, NP, R>, Error>
+pub fn spawn<C, CL, AH, H, P, NP, R>(handler: AH, conn: C) -> Result<Runtime<C, CL>, Error>
 where
     C: Conn,
+    CL: Clone,
     AH: Into<Arc<H>>,
-    H: Handler<P, NP, R> + 'static,
+    H: Handler<CL, P, NP, R> + 'static,
     P: Atom,
     NP: Atom,
     R: Atom,
@@ -227,12 +213,12 @@ where
     let (tx, rx) = mpsc::channel();
     let runtime_tx = tx.clone();
 
-    let client = Client::<P, NP, R> {
+    let client = Caller::<P, NP, R> {
         queue: queue.clone(),
         sink: tx,
     };
 
-    let proto_client = client.clone();
+    let client_template = H::make_client(client.clone());
 
     let encode_queue = queue.clone();
     let encode_handle = std::thread::spawn(move || {
@@ -319,23 +305,24 @@ where
 
     debug!("Spawned runtime!");
     Ok(Runtime {
-        proto_client,
+        client_template,
         shutdown_handle,
         encode_handle: Some(encode_handle),
         decode_handle: Some(decode_handle),
     })
 }
 
-fn handle_message<P, NP, R, H>(
+fn handle_message<P, NP, R, H, CL>(
     inbound: Message<P, NP, R>,
     handler: Arc<H>,
-    client: Client<P, NP, R>,
+    client: Caller<P, NP, R>,
 ) -> Result<(), Error>
 where
     P: Atom,
     NP: Atom,
     R: Atom,
-    H: Handler<P, NP, R>,
+    CL: Clone,
+    H: Handler<CL, P, NP, R>,
 {
     match inbound {
         Message::Request { id, params } => {
