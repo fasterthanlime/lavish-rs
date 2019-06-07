@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use log::*;
@@ -49,6 +48,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub enum SinkValue<P, NP, R>
 where
     P: Atom,
@@ -169,16 +169,18 @@ where
     R: Atom,
 {
     pub fn join(&self) -> Result<(), Box<dyn Any + Send>> {
-        debug!("Runtime.join: receiving first error");
+        debug!("Runtime.join: res1: receiving...");
         let res1 = self.err_rx.recv().unwrap();
         if let Err(e) = res1.as_ref() {
             warn!("While joining: {:#?}", e);
         }
-        debug!("Runtime.join: receiving second error");
+        debug!("Runtime.join: res1: received.");
+        debug!("Runtime.join: res2: receiving...");
         let res2 = self.err_rx.recv().unwrap();
         if let Err(e) = res2.as_ref() {
             warn!("While joining: {:#?}", e);
         }
+        debug!("Runtime.join: res2: received.");
 
         match res1 {
             Err(e) => return Err(e),
@@ -194,9 +196,9 @@ where
     }
 
     pub fn shutdown(&self) -> Result<(), Error> {
-        debug!("Runtime: shutting down ");
+        debug!("Runtime: shutting down conn");
         self.shutdown_handle.shutdown(Shutdown::Both)?;
-        debug!("Runtime: did shut down both sides of conn");
+        debug!("Runtime: conn was shut down (both sides)");
         Ok(())
     }
 }
@@ -232,6 +234,7 @@ where
     let mut decoder = Decoder::new(read, queue.clone());
     let mut encoder = Encoder::new(write);
     let (tx, rx) = mpsc::channel();
+    let runtime_tx = tx.clone();
 
     let client = Client::<P, NP, R> {
         queue: queue.clone(),
@@ -244,15 +247,18 @@ where
 
     let encode_handle = std::thread::spawn(move || loop {
         match rx.recv() {
-            Ok(val) => match val {
-                SinkValue::Message(m) => {
-                    encoder.encode(m).unwrap();
+            Ok(val) => {
+                debug!("Encoder thread: received {:#?}", val);
+                match val {
+                    SinkValue::Message(m) => {
+                        encoder.encode(m).unwrap();
+                    }
+                    SinkValue::Shutdown => {
+                        debug!("Encoder thread: received shutdown");
+                        return;
+                    }
                 }
-                SinkValue::Shutdown => {
-                    debug!("Encoder thread: received shutdown");
-                    return;
-                }
-            },
+            }
             Err(e) => {
                 debug!("Encoder thread: all senders dropped");
                 debug!("Encoder thread: error was: {:#?}", e);
@@ -283,6 +289,10 @@ where
             }
             None => {
                 // Signals EOF, we're done here
+                debug!("Decode thread: received None value, end of stream");
+                debug!("Decode thread: sending shutdown to encode thread");
+                runtime_tx.send(SinkValue::Shutdown).ok();
+                debug!("Decode thread: returning");
                 return;
             }
         }

@@ -8,8 +8,6 @@ use std::marker::PhantomData;
 
 use std::sync::{Arc, Mutex};
 
-use log::*;
-
 const MAX_MESSAGE_SIZE: usize = 128 * 1024;
 
 pub struct Encoder<P, NP, R, IO>
@@ -101,7 +99,6 @@ where
 
     pub fn decode(&mut self) -> Result<Option<Message<P, NP, R>>, Error> {
         use serde::de::Deserializer;
-        use std::error::Error;
         use std::io;
 
         let mut deser = rmp_serde::Deserializer::new(&mut self.read);
@@ -124,6 +121,10 @@ where
         let payload = Message::<P, NP, R>::deserialize(&mut deser, &*pr)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         Ok(Some(payload))
+    }
+
+    pub fn into_inner(self) -> IO {
+        self.read
     }
 }
 
