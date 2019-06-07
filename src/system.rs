@@ -3,7 +3,7 @@ use super::{Atom, Error, Message, PendingRequests};
 use std::any::Any;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -127,6 +127,10 @@ where
             Err(msg) => Err(Error::TransportError(format!("{:#?}", msg))),
         }
     }
+
+    pub fn shutdown_runtime(&self) {
+        self.conn_ref.shutdown();
+    }
 }
 
 pub fn default_timeout() -> Duration {
@@ -134,39 +138,79 @@ pub fn default_timeout() -> Duration {
 }
 
 // Connect to an address over TCP, then spawn a new RPC
-// system with the given handler
-pub fn connect<AH, H, CL, P, NP, R>(handler: AH, addr: &SocketAddr) -> Result<Runtime<CL>, Error>
+// system with the given handler.
+pub fn connect<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Runtime<CL>, Error>
 where
     AH: Into<Arc<H>>,
+    A: ToSocketAddrs,
     H: Handler<CL, P, NP, R> + 'static,
     CL: Clone,
     P: Atom,
     NP: Atom,
     R: Atom,
 {
-    let conn = TcpStream::connect_timeout(addr, default_timeout())?;
+    connect_timeout(handler, addr, Some(default_timeout()))
+}
+
+pub fn connect_timeout<AH, A, H, CL, P, NP, R>(
+    handler: AH,
+    addr: A,
+    timeout: Option<Duration>,
+) -> Result<Runtime<CL>, Error>
+where
+    AH: Into<Arc<H>>,
+    A: ToSocketAddrs,
+    H: Handler<CL, P, NP, R> + 'static,
+    CL: Clone,
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
+    let conn = match timeout {
+        Some(timeout) => {
+            let addr = addr.to_socket_addrs()?.next().unwrap();
+            TcpStream::connect_timeout(&addr, timeout)
+        }
+        None => TcpStream::connect(addr),
+    }?;
+    conn.set_nodelay(true)?;
     return spawn(handler, Box::new(conn));
 }
 
-pub fn listen<AH, H, CL, P, NP, R>(handler: AH, addr: &SocketAddr) -> Result<JoinHandle<()>, Error>
+pub fn serve<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<JoinHandle<()>, Error>
 where
     AH: Into<Arc<H>>,
+    A: ToSocketAddrs,
     H: Handler<CL, P, NP, R> + 'static,
     CL: Clone,
     P: Atom,
     NP: Atom,
     R: Atom,
 {
-    listen_with_max_conns(handler, addr, None)
+    serve_max_conns(handler, addr, None)
 }
 
-pub fn listen_with_max_conns<AH, H, CL, P, NP, R>(
+pub fn serve_once<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<JoinHandle<()>, Error>
+where
+    AH: Into<Arc<H>>,
+    A: ToSocketAddrs,
+    H: Handler<CL, P, NP, R> + 'static,
+    CL: Clone,
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
+    serve_max_conns(handler, addr, Some(1))
+}
+
+pub fn serve_max_conns<AH, A, H, CL, P, NP, R>(
     handler: AH,
-    addr: &SocketAddr,
+    addr: A,
     max_conns: Option<usize>,
 ) -> Result<JoinHandle<()>, Error>
 where
     AH: Into<Arc<H>>,
+    A: ToSocketAddrs,
     H: Handler<CL, P, NP, R> + 'static,
     CL: Clone,
     P: Atom,
@@ -181,6 +225,7 @@ where
         let mut incoming = listener.incoming();
         while let Some(conn) = incoming.next() {
             let conn = conn.unwrap();
+            conn.set_nodelay(true).unwrap();
             let handler = handler.clone();
             // oh poor rustc you needed a little push there
             spawn::<CL, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap();
