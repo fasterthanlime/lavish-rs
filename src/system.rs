@@ -229,6 +229,7 @@ where
     let queue = Arc::new(Mutex::new(Queue::new()));
 
     let shutdown_handle = conn.try_clone()?;
+    let encoder_shutdown_handle = conn.try_clone()?;
     let write = conn.try_clone()?;
     let read = conn;
     let mut decoder = Decoder::new(read, queue.clone());
@@ -251,7 +252,12 @@ where
                 debug!("Encoder thread: received {:#?}", val);
                 match val {
                     SinkValue::Message(m) => {
-                        encoder.encode(m).unwrap();
+                        if let Err(e) = encoder.encode(m) {
+                            debug!("Encoder thread: could not encode: {:#?}", e);
+                            debug!("Encoder thread: shutting down conn");
+                            encoder_shutdown_handle.shutdown(Shutdown::Both).ok();
+                            return;
+                        }
                     }
                     SinkValue::Shutdown => {
                         debug!("Encoder thread: received shutdown");
@@ -266,10 +272,22 @@ where
             }
         }
     });
+
+    let encode_queue = queue.clone();
     std::thread::spawn(move || {
         // if we can't send it it's because Runtime has been dropped,
         // no big deal.
         err_tx.send(encode_handle.join()).ok();
+        debug!("Encoder thread watcher: cancelling pending requests");
+        let queue = encode_queue.lock().unwrap();
+        for (k, v) in &queue.in_flight_requests {
+            v.tx.send(Message::Response {
+                id: *k,
+                error: Some("Connection closed".into()),
+                results: None,
+            })
+            .ok();
+        }
         debug!("Encoder thread watcher: done");
     });
 
