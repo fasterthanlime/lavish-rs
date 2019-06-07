@@ -351,7 +351,7 @@ where
                     error: Some(format!("internal error: {:#?}", error)),
                 },
             };
-            client.sink.send(SinkValue::Message(m)).unwrap();
+            client.sink.send(SinkValue::Message(m))?;
         }
         Message::Response { id, error, results } => {
             if let Some(in_flight) = {
@@ -360,8 +360,7 @@ where
             } {
                 in_flight
                     .tx
-                    .send(Message::Response { id, error, results })
-                    .unwrap();
+                    .send(Message::Response { id, error, results })?;
             }
         }
         Message::Notification { .. } => unimplemented!(),
