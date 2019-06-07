@@ -1,44 +1,30 @@
 use super::{Atom, Error, Message, PendingRequests};
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::marker::PhantomData;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use log::*;
 
 mod codec;
 use codec::{Decoder, Encoder};
 
 pub trait Conn: Read + Write + Send + Sized + 'static {
     fn try_clone(&self) -> io::Result<Self>;
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
 }
 
 impl Conn for std::net::TcpStream {
     fn try_clone(&self) -> io::Result<Self> {
         self.try_clone()
     }
-}
 
-#[derive(Clone, Copy)]
-pub struct Protocol<P, NP, R>
-where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
-{
-    phantom: PhantomData<(P, NP, R)>,
-}
-
-impl<P, NP, R> Protocol<P, NP, R>
-where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
-{
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.shutdown(how)
     }
 }
 
@@ -63,6 +49,16 @@ where
     }
 }
 
+pub enum SinkValue<P, NP, R>
+where
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
+    Shutdown,
+    Message(Message<P, NP, R>),
+}
+
 pub struct Client<P, NP, R>
 where
     P: Atom,
@@ -70,7 +66,7 @@ where
     R: Atom,
 {
     queue: Arc<Mutex<Queue<P, NP, R>>>,
-    sink: mpsc::Sender<Message<P, NP, R>>,
+    sink: mpsc::Sender<SinkValue<P, NP, R>>,
 }
 
 impl<P, NP, R> Client<P, NP, R>
@@ -104,7 +100,7 @@ where
 
         {
             let sink = self.sink.clone();
-            sink.send(m)?;
+            sink.send(SinkValue::Message(m))?;
         }
         Ok(rx.recv()?)
     }
@@ -132,22 +128,91 @@ where
     }
 }
 
-pub fn connect<C, H, P, NP, R>(
-    protocol: Protocol<P, NP, R>,
-    handler: H,
-    io: C,
-) -> Result<Client<P, NP, R>, Error>
+pub fn default_timeout() -> Duration {
+    Duration::from_secs(2)
+}
+
+// Connect to a TCP address, then spawn a new RPC
+// system with the given handler
+pub fn connect_tcp<AH, H, P, NP, R>(
+    handler: AH,
+    addr: &SocketAddr,
+) -> Result<Runtime<TcpStream, P, NP, R>, Error>
 where
-    C: Conn,
+    AH: Into<Arc<H>>,
     H: Handler<P, NP, R> + 'static,
     P: Atom,
     NP: Atom,
     R: Atom,
 {
-    let queue = Arc::new(Mutex::new(Queue::new(protocol)));
+    let conn = TcpStream::connect_timeout(addr, default_timeout())?;
+    return spawn(handler, conn);
+}
 
-    let write = io.try_clone()?;
-    let read = io;
+pub struct Runtime<C, P, NP, R>
+where
+    C: Conn,
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
+    proto_client: Client<P, NP, R>,
+    err_rx: mpsc::Receiver<Result<(), Box<dyn Any + Send>>>,
+    shutdown_handle: C,
+}
+
+impl<C, P, NP, R> Runtime<C, P, NP, R>
+where
+    C: Conn,
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
+    pub fn join(&self) -> Result<(), Box<dyn Any + Send>> {
+        let res1 = self.err_rx.recv().unwrap();
+        if let Err(e) = res1.as_ref() {
+            warn!("While joining: {:#?}", e);
+        }
+        let res2 = self.err_rx.recv().unwrap();
+        if let Err(e) = res2.as_ref() {
+            warn!("While joining: {:#?}", e);
+        }
+
+        match res1 {
+            Err(e) => return Err(e),
+            _ => match res2 {
+                Err(e) => return Err(e),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    pub fn client(&self) -> Client<P, NP, R> {
+        self.proto_client.clone()
+    }
+
+    pub fn shutdown(&self) -> Result<(), Error> {
+        debug!("Runtime: shutting down ");
+        self.shutdown_handle.shutdown(Shutdown::Both)?;
+        Ok(())
+    }
+}
+
+pub fn spawn<C, AH, H, P, NP, R>(handler: AH, conn: C) -> Result<Runtime<C, P, NP, R>, Error>
+where
+    C: Conn,
+    AH: Into<Arc<H>>,
+    H: Handler<P, NP, R> + 'static,
+    P: Atom,
+    NP: Atom,
+    R: Atom,
+{
+    let handler = handler.into();
+    let queue = Arc::new(Mutex::new(Queue::new()));
+
+    let shutdown_handle = conn.try_clone()?;
+    let write = conn.try_clone()?;
+    let read = conn;
     let mut decoder = Decoder::new(read, queue.clone());
     let mut encoder = Encoder::new(write);
     let (tx, rx) = mpsc::channel();
@@ -157,38 +222,46 @@ where
         sink: tx,
     };
 
-    let ret = client.clone();
+    let proto_client = client.clone();
+    let (err_tx, err_rx) = mpsc::channel();
+    let err_tx2 = err_tx.clone();
 
-    // TODO: shutdown handling
-    std::thread::spawn(move || {
-        // FIXME: error handling
-        loop {
-            let m = rx.recv().unwrap();
-            encoder.encode(m).unwrap();
+    let encode_handle = std::thread::spawn(move || loop {
+        match rx.recv().unwrap() {
+            SinkValue::Message(m) => {
+                encoder.encode(m).unwrap();
+            }
+            SinkValue::Shutdown => {
+                debug!("Encoder loop: dropping receiver");
+                return;
+            }
         }
     });
-
-    // TODO: shutdown handling
     std::thread::spawn(move || {
-        let handler = Arc::new(handler);
-
-        // FIXME: error handling
-        loop {
-            let m = decoder.decode().unwrap();
-            let handler = handler.clone();
-            let client = client.clone();
-
-            std::thread::spawn(move || {
-                // TODO: error handling
-                let res = handle_message(m, handler, client);
-                if let Err(e) = res {
-                    eprintln!("message stream error: {:#?}", e);
-                }
-            });
-        }
+        err_tx.send(encode_handle.join()).unwrap();
     });
 
-    Ok(ret)
+    let decode_handle = std::thread::spawn(move || loop {
+        let m = decoder.decode().unwrap();
+        let handler = handler.clone();
+        let client = client.clone();
+
+        std::thread::spawn(move || {
+            let res = handle_message(m, handler, client);
+            if let Err(e) = res {
+                eprintln!("message stream error: {:#?}", e);
+            }
+        });
+    });
+    std::thread::spawn(move || {
+        err_tx2.send(decode_handle.join()).unwrap();
+    });
+
+    Ok(Runtime {
+        proto_client,
+        err_rx,
+        shutdown_handle,
+    })
 }
 
 fn handle_message<P, NP, R, H>(
@@ -216,7 +289,7 @@ where
                     error: Some(format!("internal error: {:#?}", error)),
                 },
             };
-            client.sink.send(m).unwrap();
+            client.sink.send(SinkValue::Message(m)).unwrap();
         }
         Message::Response { id, error, results } => {
             if let Some(in_flight) = {
@@ -260,7 +333,7 @@ where
     NP: Atom,
     R: Atom,
 {
-    fn new(_protocol: Protocol<P, NP, R>) -> Self {
+    fn new() -> Self {
         Queue {
             id: 0,
             in_flight_requests: HashMap::new(),

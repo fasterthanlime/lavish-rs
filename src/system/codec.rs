@@ -69,6 +69,10 @@ where
         self.write.write_all(payload_slice)?;
         Ok(())
     }
+
+    pub fn into_inner(self) -> IO {
+        self.write
+    }
 }
 
 pub struct Decoder<P, NP, R, IO>
