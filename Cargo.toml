@@ -20,9 +20,8 @@ serde = "1.0.92"
 rmp-serde = "0.13.7"
 erased-serde = "0.3.9"
 serde_derive = "1.0.92"
+serde_bytes = "0.11.1"
+serde_repr = "0.1.4"
 bytes = "0.4.12"
 chrono = { version = "0.4.6", features = ["serde"] }
 log = "0.4.6"
-
-[dev-dependencies]
-serde_bytes = "0.11.1"
