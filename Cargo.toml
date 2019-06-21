@@ -27,3 +27,6 @@ bytes = "0.4.12"
 chrono = { version = "0.4.6", features = ["serde"] }
 log = "0.4.6"
 num-traits = "0.2.8"
+
+[dev-dependencies]
+netbuf = "0.4.1"

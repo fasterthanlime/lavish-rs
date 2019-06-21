@@ -499,6 +499,22 @@ where
     t.write(tt, wr)
 }
 
+pub fn read<TT, T, R>(rd: &mut Reader<R>) -> Result<T, Error>
+where
+    T: Factual<TT>,
+    R: Read,
+{
+    T::read(rd)
+}
+
+pub fn read_simple<T, R>(rd: &mut Reader<R>) -> Result<T, Error>
+where
+    T: Factual<()>,
+    R: Read,
+{
+    T::read(rd)
+}
+
 pub struct OffsetList(pub Vec<i32>);
 
 pub enum TranslationTable {
@@ -572,3 +588,23 @@ pub enum BaseType {
     Data,
     Timestamp,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Factual, Reader};
+    use netbuf::Buf;
+
+    #[test]
+    fn base_types() -> Result<(), Box<std::error::Error>> {
+        let l: i32 = 24;
+        let mut buf = Buf::new();
+        l.write(&(), &mut buf)?;
+        let mut slice = &buf[..];
+        let r: i32 = super::read_simple(&mut Reader::new(&mut slice))?;
+
+        assert_eq!(l, r);
+
+        Ok(())
+    }
+}
+
