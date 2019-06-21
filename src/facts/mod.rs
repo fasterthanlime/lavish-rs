@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::marker::Sized;
 
 use std::io::{Read, Write};
@@ -58,6 +59,12 @@ impl From<ValueWriteError> for Error {
 impl From<ValueReadError> for Error {
     fn from(err: ValueReadError) -> Self {
         Error::ValueReadError(err)
+    }
+}
+
+impl From<NumValueReadError> for Error {
+    fn from(err: NumValueReadError) -> Self {
+        Error::NumValueReadError(err)
     }
 }
 
@@ -145,6 +152,17 @@ where
     }
 
     #[inline]
+    pub fn read_map_len(&mut self) -> Result<usize, Error> {
+        let marker = self.fetch_marker()?;
+        Ok(match marker {
+            Marker::FixMap(len) => len as usize,
+            Marker::Map16 => rmp::decode::read_data_u16(self)? as usize,
+            Marker::Map32 => rmp::decode::read_data_u32(self)? as usize,
+            _ => return Err(ValueReadError::TypeMismatch(marker).into()),
+        })
+    }
+
+    #[inline]
     pub fn read_int<T>(&mut self) -> Result<T, Error>
     where
         T: FromPrimitive,
@@ -161,13 +179,19 @@ where
             Marker::I16 => T::from_i16(rmp::decode::read_data_i16(self)?),
             Marker::I32 => T::from_i32(rmp::decode::read_data_i32(self)?),
             Marker::I64 => T::from_i64(rmp::decode::read_data_i64(self)?),
-            marker => {
-                return Err(Error::NumValueReadError(NumValueReadError::TypeMismatch(
-                    marker,
-                )))
-            }
+            marker => return Err(NumValueReadError::TypeMismatch(marker).into()),
         }
-        .ok_or_else(|| Error::NumValueReadError(NumValueReadError::OutOfRange))
+        .ok_or_else(|| NumValueReadError::OutOfRange.into())
+    }
+
+    #[inline]
+    pub fn read_bool(&mut self) -> Result<bool, Error> {
+        let marker = self.fetch_marker()?;
+        match marker {
+            Marker::True => Ok(true),
+            Marker::False => Ok(false),
+            marker => Err(ValueReadError::TypeMismatch(marker).into()),
+        }
     }
 
     #[inline]
@@ -307,6 +331,34 @@ where
     }
 }
 
+// we'd make clippy happy here, but we also need to call 'new'
+// and it's only defined for the default hasher, so, welp.
+#[allow(clippy::implicit_hasher)]
+impl<'a, K, V, TT> Factual<TT> for HashMap<K, V>
+where
+    K: Factual<TT> + Hash + Eq,
+    V: Factual<TT>,
+{
+    fn write<W: Write>(&self, tt: &TT, wr: &mut W) -> Result<(), Error> {
+        rmp::encode::write_map_len(wr, self.len() as u32)?;
+        for (k, v) in self {
+            k.write(tt, wr)?;
+            v.write(tt, wr)?;
+        }
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        let len = rd.read_array_len()?;
+
+        let mut res = Self::new();
+        for _ in 0..len {
+            res.insert(Self::subread(rd)?, Self::subread(rd)?);
+        }
+        Ok(res)
+    }
+}
+
 impl<'a, TT> Factual<TT> for i8 {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
@@ -398,6 +450,17 @@ impl<'a, TT> Factual<TT> for u64 {
 
     fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
         Ok(rd.read_int()?)
+    }
+}
+
+impl<'a, TT> Factual<TT> for bool {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        rmp::encode::write_bool(wr, *self)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        Ok(rd.read_bool()?)
     }
 }
 
