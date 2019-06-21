@@ -152,6 +152,17 @@ where
     }
 
     #[inline]
+    pub fn read_bin_len(&mut self) -> Result<usize, Error> {
+        let marker = self.fetch_marker()?;
+        Ok(match marker {
+            Marker::Bin8 => rmp::decode::read_data_u8(self)? as usize,
+            Marker::Bin16 => rmp::decode::read_data_u16(self)? as usize,
+            Marker::Bin32 => rmp::decode::read_data_u32(self)? as usize,
+            _ => return Err(ValueReadError::TypeMismatch(marker).into()),
+        })
+    }
+
+    #[inline]
     pub fn read_map_len(&mut self) -> Result<usize, Error> {
         let marker = self.fetch_marker()?;
         Ok(match marker {
@@ -275,7 +286,7 @@ impl<'a, TT> Factual<TT> for &'a str {
     }
 }
 
-impl<'a, TT> Factual<TT> for String {
+impl<TT> Factual<TT> for String {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_str(wr, self)?;
         Ok(())
@@ -307,7 +318,7 @@ where
     }
 }
 
-impl<'a, T, TT> Factual<TT> for Vec<T>
+impl<T, TT> Factual<TT> for Vec<T>
 where
     T: Factual<TT>,
 {
@@ -334,7 +345,7 @@ where
 // we'd make clippy happy here, but we also need to call 'new'
 // and it's only defined for the default hasher, so, welp.
 #[allow(clippy::implicit_hasher)]
-impl<'a, K, V, TT> Factual<TT> for HashMap<K, V>
+impl<K, V, TT> Factual<TT> for HashMap<K, V>
 where
     K: Factual<TT> + Hash + Eq,
     V: Factual<TT>,
@@ -359,7 +370,23 @@ where
     }
 }
 
-impl<'a, TT> Factual<TT> for i8 {
+pub struct Bin(Vec<u8>);
+
+impl<TT> Factual<TT> for Bin {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        rmp::encode::write_bin(wr, &self.0)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        let len = rd.read_bin_len()?;
+        let mut res = vec![0u8; len];
+        rd.read_exact(&mut res)?;
+        Ok(Self(res))
+    }
+}
+
+impl<TT> Factual<TT> for i8 {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_sint(wr, *self as i64)?;
@@ -371,7 +398,7 @@ impl<'a, TT> Factual<TT> for i8 {
     }
 }
 
-impl<'a, TT> Factual<TT> for i16 {
+impl<TT> Factual<TT> for i16 {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_sint(wr, *self as i64)?;
@@ -383,7 +410,7 @@ impl<'a, TT> Factual<TT> for i16 {
     }
 }
 
-impl<'a, TT> Factual<TT> for i32 {
+impl<TT> Factual<TT> for i32 {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_sint(wr, *self as i64)?;
@@ -395,7 +422,7 @@ impl<'a, TT> Factual<TT> for i32 {
     }
 }
 
-impl<'a, TT> Factual<TT> for i64 {
+impl<TT> Factual<TT> for i64 {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_sint(wr, *self)?;
         Ok(())
@@ -406,7 +433,7 @@ impl<'a, TT> Factual<TT> for i64 {
     }
 }
 
-impl<'a, TT> Factual<TT> for u8 {
+impl<TT> Factual<TT> for u8 {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_uint(wr, *self as u64)?;
@@ -418,7 +445,7 @@ impl<'a, TT> Factual<TT> for u8 {
     }
 }
 
-impl<'a, TT> Factual<TT> for u16 {
+impl<TT> Factual<TT> for u16 {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_uint(wr, *self as u64)?;
@@ -430,7 +457,7 @@ impl<'a, TT> Factual<TT> for u16 {
     }
 }
 
-impl<'a, TT> Factual<TT> for u32 {
+impl<TT> Factual<TT> for u32 {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_uint(wr, *self as u64)?;
@@ -442,7 +469,7 @@ impl<'a, TT> Factual<TT> for u32 {
     }
 }
 
-impl<'a, TT> Factual<TT> for u64 {
+impl<TT> Factual<TT> for u64 {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_uint(wr, *self)?;
         Ok(())
@@ -453,7 +480,7 @@ impl<'a, TT> Factual<TT> for u64 {
     }
 }
 
-impl<'a, TT> Factual<TT> for bool {
+impl<TT> Factual<TT> for bool {
     fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_bool(wr, *self)?;
         Ok(())
