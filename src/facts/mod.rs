@@ -3,9 +3,11 @@ use std::marker::Sized;
 
 use std::io::{Read, Write};
 
-use rmp::decode::{DecodeStringError, MarkerReadError, ValueReadError};
+use rmp::decode::{DecodeStringError, MarkerReadError, NumValueReadError, ValueReadError};
 use rmp::encode::ValueWriteError;
 use rmp::Marker;
+
+use num_traits::cast::FromPrimitive;
 
 /**********************************************************************
  * Error type
@@ -19,6 +21,7 @@ pub enum Error {
     DecodeStringError(),
     ValueWriteError(ValueWriteError),
     ValueReadError(ValueReadError),
+    NumValueReadError(NumValueReadError),
     MarkerReadError(MarkerReadError),
 }
 
@@ -139,6 +142,41 @@ where
             Marker::Array32 => rmp::decode::read_data_u32(self)? as usize,
             _ => return Err(ValueReadError::TypeMismatch(marker).into()),
         })
+    }
+
+    #[inline]
+    pub fn read_int<T>(&mut self) -> Result<T, Error>
+    where
+        T: FromPrimitive,
+    {
+        let marker = self.fetch_marker()?;
+        match marker {
+            Marker::FixPos(val) => T::from_u8(val),
+            Marker::FixNeg(val) => T::from_i8(val),
+            Marker::U8 => T::from_u8(rmp::decode::read_data_u8(self)?),
+            Marker::U16 => T::from_u16(rmp::decode::read_data_u16(self)?),
+            Marker::U32 => T::from_u32(rmp::decode::read_data_u32(self)?),
+            Marker::U64 => T::from_u64(rmp::decode::read_data_u64(self)?),
+            Marker::I8 => T::from_i8(rmp::decode::read_data_i8(self)?),
+            Marker::I16 => T::from_i16(rmp::decode::read_data_i16(self)?),
+            Marker::I32 => T::from_i32(rmp::decode::read_data_i32(self)?),
+            Marker::I64 => T::from_i64(rmp::decode::read_data_i64(self)?),
+            marker => {
+                return Err(Error::NumValueReadError(NumValueReadError::TypeMismatch(
+                    marker,
+                )))
+            }
+        }
+        .ok_or_else(|| Error::NumValueReadError(NumValueReadError::OutOfRange))
+    }
+
+    #[inline]
+    pub fn expect_marker(&mut self, expected: Marker) -> Result<(), Error> {
+        let marker = self.fetch_marker()?;
+        if marker == expected {
+            return Ok(());
+        }
+        Err(ValueReadError::TypeMismatch(marker).into())
     }
 
     #[inline]
@@ -266,6 +304,100 @@ where
             res.push(T::read(rd)?);
         }
         Ok(res)
+    }
+}
+
+impl<'a, TT> Factual<TT> for i8 {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        #[allow(clippy::cast_lossless)]
+        rmp::encode::write_sint(wr, *self as i64)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        Ok(rd.read_int()?)
+    }
+}
+
+impl<'a, TT> Factual<TT> for i16 {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        #[allow(clippy::cast_lossless)]
+        rmp::encode::write_sint(wr, *self as i64)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        Ok(rd.read_int()?)
+    }
+}
+
+impl<'a, TT> Factual<TT> for i32 {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        #[allow(clippy::cast_lossless)]
+        rmp::encode::write_sint(wr, *self as i64)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        Ok(rd.read_int()?)
+    }
+}
+
+impl<'a, TT> Factual<TT> for i64 {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        rmp::encode::write_sint(wr, *self)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        Ok(rd.read_int()?)
+    }
+}
+
+impl<'a, TT> Factual<TT> for u8 {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        #[allow(clippy::cast_lossless)]
+        rmp::encode::write_uint(wr, *self as u64)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        Ok(rd.read_int()?)
+    }
+}
+
+impl<'a, TT> Factual<TT> for u16 {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        #[allow(clippy::cast_lossless)]
+        rmp::encode::write_uint(wr, *self as u64)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        Ok(rd.read_int()?)
+    }
+}
+
+impl<'a, TT> Factual<TT> for u32 {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        #[allow(clippy::cast_lossless)]
+        rmp::encode::write_uint(wr, *self as u64)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        Ok(rd.read_int()?)
+    }
+}
+
+impl<'a, TT> Factual<TT> for u64 {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        rmp::encode::write_uint(wr, *self)?;
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        Ok(rd.read_int()?)
     }
 }
 
