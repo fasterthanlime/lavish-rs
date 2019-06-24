@@ -785,6 +785,9 @@ mod tests {
         // some time far into the future (year 2600 - amos's 610th birthday)
         cycle_timestamp(19898323200, 0, rmp::Marker::Ext8)?;
 
+        // some time far into the future, with nanos
+        cycle_timestamp(19898323200, 2359807, rmp::Marker::Ext8)?;
+
         Ok(())
     }
 
