@@ -686,6 +686,7 @@ where
     T::read(rd)
 }
 
+#[derive(Debug)]
 pub struct OffsetList(pub Vec<i32>);
 
 impl OffsetList {
@@ -700,6 +701,7 @@ impl OffsetList {
     }
 }
 
+#[derive(Debug)]
 pub enum TypeMapping {
     Mapped(OffsetList),
     Incompatible(String),
