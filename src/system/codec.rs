@@ -1,66 +1,59 @@
+use super::super::facts::{self, Factual, Mapping};
 use super::super::{Atom, Message};
 use super::Error;
-use super::Queue;
 
-use serde::Serialize;
-use std::io::{Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::marker::PhantomData;
-
-use std::sync::{Arc, Mutex};
 
 const MAX_MESSAGE_SIZE: usize = 128 * 1024;
 
-pub struct Encoder<P, NP, R, IO>
+pub struct Encoder<M, P, NP, R, IO>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
     IO: Write,
 {
     phantom: PhantomData<(P, NP, R)>,
     buffer: Vec<u8>,
+    mapping: M,
     write: IO,
 }
 
-impl<P, NP, R, IO> Encoder<P, NP, R, IO>
+impl<M, P, NP, R, IO> Encoder<M, P, NP, R, IO>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
     IO: Write,
 {
-    pub fn new(write: IO) -> Self {
+    pub fn new(write: IO, mapping: M) -> Self {
         let buffer: Vec<u8> = vec![0; MAX_MESSAGE_SIZE];
         Self {
             write,
             buffer,
+            mapping,
             phantom: PhantomData,
         }
     }
 
-    pub fn encode(&mut self, item: Message<P, NP, R>) -> Result<(), Error> {
-        use std::io;
-
+    pub fn encode(&mut self, item: Message<M, P, NP, R>) -> Result<(), Error> {
         let payload_slice = {
-            let cursor = Cursor::new(&mut self.buffer[..]);
-            let mut ser = rmp_serde::Serializer::new_named(cursor);
-            item.serialize(&mut ser)
+            let mut cursor = Cursor::new(&mut self.buffer[..]);
+            item.write(&self.mapping, &mut cursor)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            let cursor = ser.into_inner();
             let written = cursor.position() as usize;
             &self.buffer[..written]
         };
 
         let mut length_buffer = vec![0; 16];
         let length_slice = {
-            use serde::ser::Serializer;
-
-            let cursor = Cursor::new(&mut length_buffer);
-            let mut ser = rmp_serde::Serializer::new(cursor);
-            ser.serialize_u64(payload_slice.len() as u64)
+            let mut cursor = Cursor::new(&mut length_buffer);
+            (payload_slice.len() as u64)
+                .write(&self.mapping, &mut cursor)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-            let cursor = ser.into_inner();
             let written = cursor.position() as usize;
             &length_buffer[..written]
         };
@@ -71,68 +64,52 @@ where
     }
 }
 
-pub struct Decoder<P, NP, R, IO>
+pub struct Decoder<M, P, NP, R, IO>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
     IO: Read,
 {
-    read: IO,
-    queue: Arc<Mutex<Queue<P, NP, R>>>,
+    reader: facts::Reader<IO>,
+    phantom: PhantomData<(M, P, NP, R)>,
 }
 
-impl<P, NP, R, IO> Decoder<P, NP, R, IO>
+impl<M, P, NP, R, IO> Decoder<M, P, NP, R, IO>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
     IO: Read,
 {
-    pub fn new(read: IO, queue: Arc<Mutex<Queue<P, NP, R>>>) -> Self {
-        Self { read, queue }
+    pub fn new(read: IO) -> Self {
+        Self {
+            reader: facts::Reader::new(read),
+            phantom: PhantomData,
+        }
     }
 
-    pub fn decode(&mut self) -> Result<Option<Message<P, NP, R>>, Error> {
-        use serde::de::Deserializer;
-        use std::io;
-
-        let mut deser = rmp_serde::Deserializer::new(&mut self.read);
-        // deserialize payload len
-        match deser.deserialize_u64(LengthVisitor {}) {
+    pub fn decode(&mut self) -> Result<Option<Message<M, P, NP, R>>, Error> {
+        match self.reader.read_int::<u64>() {
+            Ok(_) => { /* ignore length */ }
             Err(e) => {
                 match &e {
-                    rmp_serde::decode::Error::InvalidMarkerRead(e) => match e.kind() {
-                        std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                        _ => {}
-                    },
+                    facts::Error::MarkerReadError(rmp::decode::MarkerReadError(e)) => {
+                        match e.kind() {
+                            std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                            _ => {}
+                        }
+                    }
                     _ => {}
                 };
                 return Err(io::Error::new(io::ErrorKind::Other, e).into());
             }
-            Ok(_) => {}
         };
 
-        let pr = self.queue.lock()?;
-        let payload = Message::<P, NP, R>::deserialize(&mut deser, &*pr)
+        let payload = Message::<M, P, NP, R>::read(&mut self.reader)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         Ok(Some(payload))
-    }
-}
-
-struct LengthVisitor {}
-
-impl<'de> serde::de::Visitor<'de> for LengthVisitor {
-    type Value = u64;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a framed msgpack-rpc payload length")
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(value)
     }
 }

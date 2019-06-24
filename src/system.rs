@@ -1,8 +1,10 @@
+use super::facts::Mapping;
 use super::{Atom, Error, Message, PendingRequests};
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::marker::PhantomData;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
@@ -29,44 +31,48 @@ impl Conn for std::net::TcpStream {
     }
 }
 
-pub trait Handler<CL, P, NP, R>: Sync + Send
+pub trait Handler<CL, M, P, NP, R>: Sync + Send
 where
     CL: Clone,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
-    fn handle(&self, client: Caller<P, NP, R>, params: P) -> Result<R, Error>;
-    fn make_client(client: Caller<P, NP, R>) -> CL;
+    fn handle(&self, client: Caller<M, P, NP, R>, params: P) -> Result<R, Error>;
+    fn make_client(client: Caller<M, P, NP, R>) -> CL;
 }
 
 #[derive(Debug)]
-pub enum SinkValue<P, NP, R>
+pub enum SinkValue<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     Shutdown,
-    Message(Message<P, NP, R>),
+    Message(Message<M, P, NP, R>),
 }
 
-pub struct Caller<P, NP, R>
+pub struct Caller<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     conn_ref: Arc<ConnRef>,
-    queue: Arc<Mutex<Queue<P, NP, R>>>,
-    sink: mpsc::Sender<SinkValue<P, NP, R>>,
+    queue: Arc<Mutex<Queue<M, P, NP, R>>>,
+    sink: mpsc::Sender<SinkValue<M, P, NP, R>>,
 }
 
-impl<P, NP, R> Clone for Caller<P, NP, R>
+impl<M, P, NP, R> Clone for Caller<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     fn clone(&self) -> Self {
         Caller {
@@ -77,22 +83,27 @@ where
     }
 }
 
-impl<P, NP, R> Caller<P, NP, R>
+impl<M, P, NP, R> Caller<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
-    pub fn call_raw(&self, params: P) -> Result<Message<P, NP, R>, Error> {
+    pub fn call_raw(&self, params: P) -> Result<Message<M, P, NP, R>, Error> {
         let id = {
             let mut queue = self.queue.lock()?;
             queue.next_id()
         };
 
         let method = params.method();
-        let m = Message::Request { id, params };
+        let m = Message::Request {
+            id,
+            params,
+            phantom: PhantomData,
+        };
 
-        let (tx, rx) = mpsc::channel::<Message<P, NP, R>>();
+        let (tx, rx) = mpsc::channel::<Message<M, P, NP, R>>();
         let in_flight = InFlightRequest { method, tx };
         {
             let mut queue = self.queue.lock()?;
@@ -139,20 +150,21 @@ pub fn default_timeout() -> Duration {
 
 // Connect to an address over TCP, then spawn a new RPC
 // system with the given handler.
-pub fn connect<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Runtime<CL>, Error>
+pub fn connect<M, AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Runtime<CL>, Error>
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
-    H: Handler<CL, P, NP, R> + 'static,
+    H: Handler<CL, M, P, NP, R> + 'static,
     CL: Clone,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     connect_timeout(handler, addr, Some(default_timeout()))
 }
 
-pub fn connect_timeout<AH, A, H, CL, P, NP, R>(
+pub fn connect_timeout<M, AH, A, H, CL, P, NP, R>(
     handler: AH,
     addr: A,
     timeout: Option<Duration>,
@@ -160,11 +172,12 @@ pub fn connect_timeout<AH, A, H, CL, P, NP, R>(
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
-    H: Handler<CL, P, NP, R> + 'static,
+    H: Handler<CL, M, P, NP, R> + 'static,
     CL: Clone,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     let conn = match timeout {
         Some(timeout) => {
@@ -174,7 +187,7 @@ where
         None => TcpStream::connect(addr),
     }?;
     conn.set_nodelay(true)?;
-    return spawn(handler, Box::new(conn));
+    spawn(handler, Box::new(conn))
 }
 
 pub struct Server {
@@ -192,33 +205,35 @@ impl Server {
     }
 }
 
-pub fn serve<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Server, Error>
+pub fn serve<M, AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Server, Error>
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
-    H: Handler<CL, P, NP, R> + 'static,
+    H: Handler<CL, M, P, NP, R> + 'static,
     CL: Clone,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     serve_max_conns(handler, addr, None)
 }
 
-pub fn serve_once<AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Server, Error>
+pub fn serve_once<M, AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Server, Error>
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
-    H: Handler<CL, P, NP, R> + 'static,
+    H: Handler<CL, M, P, NP, R> + 'static,
     CL: Clone,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     serve_max_conns(handler, addr, Some(1))
 }
 
-pub fn serve_max_conns<AH, A, H, CL, P, NP, R>(
+pub fn serve_max_conns<M, AH, A, H, CL, P, NP, R>(
     handler: AH,
     addr: A,
     max_conns: Option<usize>,
@@ -226,11 +241,12 @@ pub fn serve_max_conns<AH, A, H, CL, P, NP, R>(
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
-    H: Handler<CL, P, NP, R> + 'static,
+    H: Handler<CL, M, P, NP, R> + 'static,
     CL: Clone,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     let handler = handler.into();
     let listener = TcpListener::bind(addr)?;
@@ -244,7 +260,7 @@ where
             conn.set_nodelay(true).unwrap();
             let handler = handler.clone();
             // oh poor rustc you needed a little push there
-            spawn::<CL, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap();
+            spawn::<M, CL, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap();
 
             conn_number += 1;
             if let Some(max_conns) = max_conns {
@@ -311,14 +327,15 @@ impl Drop for ConnRef {
     }
 }
 
-pub fn spawn<CL, AH, H, P, NP, R>(handler: AH, conn: Box<Conn>) -> Result<Runtime<CL>, Error>
+pub fn spawn<M, CL, AH, H, P, NP, R>(handler: AH, conn: Box<Conn>) -> Result<Runtime<CL>, Error>
 where
     CL: Clone,
     AH: Into<Arc<H>>,
-    H: Handler<CL, P, NP, R> + 'static,
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    H: Handler<CL, M, P, NP, R> + 'static,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     let handler = handler.into();
     let queue = Arc::new(Mutex::new(Queue::new()));
@@ -331,12 +348,13 @@ where
     let decode_shutdown_handle = conn.try_clone()?;
     let write = conn.try_clone()?;
     let read = conn;
-    let mut decoder = Decoder::new(read, queue.clone());
-    let mut encoder = Encoder::new(write);
+    let mut decoder = Decoder::new(read);
+    // FIXME: default is wrong here, obviously.
+    let mut encoder = Encoder::new(write, M::default());
     let (tx, rx) = mpsc::channel();
     let runtime_tx = tx.clone();
 
-    let caller = Caller::<P, NP, R> {
+    let caller = Caller::<M, P, NP, R> {
         conn_ref: conn_ref.clone(),
         queue: queue.clone(),
         sink: tx,
@@ -348,22 +366,19 @@ where
     let encode_handle = std::thread::spawn(move || {
         'relay: loop {
             match rx.recv() {
-                Ok(val) => {
-                    debug!("Encoder thread: received {:#?}", val);
-                    match val {
-                        SinkValue::Message(m) => {
-                            if let Err(e) = encoder.encode(m) {
-                                debug!("Encoder thread: could not encode: {:#?}", e);
-                                debug!("Encoder thread: breaking");
-                                break 'relay;
-                            }
-                        }
-                        SinkValue::Shutdown => {
-                            debug!("Encoder thread: received shutdown");
+                Ok(val) => match val {
+                    SinkValue::Message(m) => {
+                        if let Err(e) = encoder.encode(m) {
+                            debug!("Encoder thread: could not encode: {:#?}", e);
+                            debug!("Encoder thread: breaking");
                             break 'relay;
                         }
                     }
-                }
+                    SinkValue::Shutdown => {
+                        debug!("Encoder thread: received shutdown");
+                        break 'relay;
+                    }
+                },
                 Err(e) => {
                     debug!("Encoder thread: could not receive");
                     debug!("Encoder thread: error was: {:#?}", e);
@@ -382,6 +397,7 @@ where
                 id: *k,
                 error: Some("Connection closed".into()),
                 results: None,
+                phantom: PhantomData,
             })
             .ok();
         }
@@ -436,42 +452,50 @@ where
     })
 }
 
-fn handle_message<P, NP, R, H, CL>(
-    inbound: Message<P, NP, R>,
+fn handle_message<M, P, NP, R, H, CL>(
+    inbound: Message<M, P, NP, R>,
     handler: Arc<H>,
-    caller: Caller<P, NP, R>,
+    caller: Caller<M, P, NP, R>,
 ) -> Result<(), Error>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
     CL: Clone,
-    H: Handler<CL, P, NP, R>,
+    H: Handler<CL, M, P, NP, R>,
+    M: Mapping,
 {
     match inbound {
-        Message::Request { id, params } => {
+        Message::Request { id, params, .. } => {
             let m = match handler.handle(caller.clone(), params) {
-                Ok(results) => Message::Response::<P, NP, R> {
+                Ok(results) => Message::Response::<M, P, NP, R> {
                     id,
                     results: Some(results),
                     error: None,
+                    phantom: PhantomData,
                 },
-                Err(error) => Message::Response::<P, NP, R> {
+                Err(error) => Message::Response::<M, P, NP, R> {
                     id,
                     results: None,
                     error: Some(format!("internal error: {:#?}", error)),
+                    phantom: PhantomData,
                 },
             };
             caller.sink.send(SinkValue::Message(m))?;
         }
-        Message::Response { id, error, results } => {
+        Message::Response {
+            id, error, results, ..
+        } => {
             if let Some(in_flight) = {
                 let mut queue = caller.queue.lock()?;
                 queue.in_flight_requests.remove(&id)
             } {
-                in_flight
-                    .tx
-                    .send(Message::Response { id, error, results })?;
+                in_flight.tx.send(Message::Response {
+                    id,
+                    error,
+                    results,
+                    phantom: PhantomData,
+                })?;
             }
         }
         Message::Notification { .. } => unimplemented!(),
@@ -479,31 +503,34 @@ where
     Ok(())
 }
 
-struct InFlightRequest<P, NP, R>
+struct InFlightRequest<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     method: &'static str,
-    tx: mpsc::Sender<Message<P, NP, R>>,
+    tx: mpsc::Sender<Message<M, P, NP, R>>,
 }
 
-pub struct Queue<P, NP, R>
+pub struct Queue<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     id: u32,
-    in_flight_requests: HashMap<u32, InFlightRequest<P, NP, R>>,
+    in_flight_requests: HashMap<u32, InFlightRequest<M, P, NP, R>>,
 }
 
-impl<P, NP, R> Queue<P, NP, R>
+impl<M, P, NP, R> Queue<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     fn new() -> Self {
         Queue {
@@ -519,11 +546,12 @@ where
     }
 }
 
-impl<P, NP, R> PendingRequests for Queue<P, NP, R>
+impl<M, P, NP, R> PendingRequests for Queue<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     fn get_pending(&self, id: u32) -> Option<&'static str> {
         self.in_flight_requests.get(&id).map(|req| req.method)

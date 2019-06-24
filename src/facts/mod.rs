@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::{self, Debug};
 use std::hash::Hash;
 use std::marker::Sized;
 
@@ -80,7 +81,6 @@ impl<'a> From<DecodeStringError<'a>> for Error {
 
 impl std::error::Error for Error {}
 
-use std::fmt;
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)
@@ -91,8 +91,13 @@ impl fmt::Display for Error {
  * Main trait
  **********************************************************************/
 
-pub trait Factual<TT> {
-    fn write<W: Write>(&self, tt: &TT, wr: &mut W) -> Result<(), Error>;
+pub trait Mapping: Default + Debug + Send + Sync + 'static {}
+
+pub trait Factual<M>
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, mapping: &M, wr: &mut W) -> Result<(), Error>;
 
     fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error>
     where
@@ -102,7 +107,7 @@ pub trait Factual<TT> {
     fn subread<R: Read, T>(rd: &mut Reader<R>) -> Result<T, Error>
     where
         Self: Sized,
-        T: Factual<TT>,
+        T: Factual<M>,
     {
         T::read(rd)
     }
@@ -164,6 +169,14 @@ where
             Marker::Bin32 => rmp::decode::read_data_u32(self)? as usize,
             _ => return Err(ValueReadError::TypeMismatch(marker).into()),
         })
+    }
+
+    #[inline]
+    pub fn read_bin(&mut self) -> Result<Vec<u8>, Error> {
+        let len = self.read_bin_len()?;
+        let mut res = vec![0u8; len];
+        self.read_exact(&mut res)?;
+        Ok(res)
     }
 
     #[inline]
@@ -255,13 +268,14 @@ where
     }
 }
 
-impl<T, TT> Factual<TT> for Option<T>
+impl<T, M> Factual<M> for Option<T>
 where
-    T: Factual<TT>,
+    T: Factual<M>,
+    M: Mapping,
 {
-    fn write<W: Write>(&self, tt: &TT, wr: &mut W) -> Result<(), Error> {
+    fn write<W: Write>(&self, mapping: &M, wr: &mut W) -> Result<(), Error> {
         match self {
-            Some(v) => v.write(tt, wr)?,
+            Some(v) => v.write(mapping, wr)?,
             None => rmp::encode::write_nil(wr)?,
         };
 
@@ -279,8 +293,11 @@ where
     }
 }
 
-impl<'a, TT> Factual<TT> for &'a str {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<'a, M> Factual<M> for &'a str
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_str(wr, self)?;
         Ok(())
     }
@@ -290,8 +307,11 @@ impl<'a, TT> Factual<TT> for &'a str {
     }
 }
 
-impl<TT> Factual<TT> for String {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for String
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_str(wr, self)?;
         Ok(())
     }
@@ -304,9 +324,12 @@ impl<TT> Factual<TT> for String {
     }
 }
 
-impl<TT> Factual<TT> for chrono::DateTime<chrono::offset::Utc> {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
-        // see https://github.com/msgpack/msgpack/blob/master/spec.md#timestamp-extension-type
+impl<M> Factual<M> for chrono::DateTime<chrono::offset::Utc>
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
+        // see hmappingps://github.com/msgpack/msgpack/blob/master/spec.md#timestamp-extension-type
 
         let tv_sec: i64 = self.timestamp();
         let tv_nsec: u32 = self.timestamp_subsec_nanos();
@@ -342,7 +365,7 @@ impl<TT> Factual<TT> for chrono::DateTime<chrono::offset::Utc> {
     }
 
     fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
-        // see https://github.com/msgpack/msgpack/blob/master/spec.md#timestamp-extension-type
+        // see hmappingps://github.com/msgpack/msgpack/blob/master/spec.md#timestamp-extension-type
 
         let marker = rd.fetch_marker()?;
         match marker {
@@ -401,14 +424,15 @@ impl<TT> Factual<TT> for chrono::DateTime<chrono::offset::Utc> {
     }
 }
 
-impl<'a, T, TT> Factual<TT> for &'a [T]
+impl<'a, T, M> Factual<M> for &'a [T]
 where
-    T: Factual<TT>,
+    T: Factual<M>,
+    M: Mapping,
 {
-    fn write<W: Write>(&self, tt: &TT, wr: &mut W) -> Result<(), Error> {
+    fn write<W: Write>(&self, mapping: &M, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_array_len(wr, self.len() as u32)?;
         for item in *self {
-            item.write(tt, wr)?;
+            item.write(mapping, wr)?;
         }
 
         Ok(())
@@ -419,14 +443,15 @@ where
     }
 }
 
-impl<T, TT> Factual<TT> for Vec<T>
+impl<T, M> Factual<M> for Vec<T>
 where
-    T: Factual<TT>,
+    T: Factual<M>,
+    M: Mapping,
 {
-    fn write<W: Write>(&self, tt: &TT, wr: &mut W) -> Result<(), Error> {
+    fn write<W: Write>(&self, mapping: &M, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_array_len(wr, self.len() as u32)?;
         for item in self {
-            item.write(tt, wr)?;
+            item.write(mapping, wr)?;
         }
 
         Ok(())
@@ -446,16 +471,17 @@ where
 // we'd make clippy happy here, but we also need to call 'new'
 // and it's only defined for the default hasher, so, welp.
 #[allow(clippy::implicit_hasher)]
-impl<K, V, TT> Factual<TT> for HashMap<K, V>
+impl<K, V, M> Factual<M> for HashMap<K, V>
 where
-    K: Factual<TT> + Hash + Eq,
-    V: Factual<TT>,
+    K: Factual<M> + Hash + Eq,
+    V: Factual<M>,
+    M: Mapping,
 {
-    fn write<W: Write>(&self, tt: &TT, wr: &mut W) -> Result<(), Error> {
+    fn write<W: Write>(&self, mapping: &M, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_map_len(wr, self.len() as u32)?;
         for (k, v) in self {
-            k.write(tt, wr)?;
-            v.write(tt, wr)?;
+            k.write(mapping, wr)?;
+            v.write(mapping, wr)?;
         }
         Ok(())
     }
@@ -472,24 +498,39 @@ where
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Bin(Vec<u8>);
+pub struct Bin(pub Vec<u8>);
 
-impl<TT> Factual<TT> for Bin {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl From<Vec<u8>> for Bin {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+
+impl AsRef<[u8]> for Bin {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<M> Factual<M> for Bin
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_bin(wr, &self.0)?;
         Ok(())
     }
 
     fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
-        let len = rd.read_bin_len()?;
-        let mut res = vec![0u8; len];
-        rd.read_exact(&mut res)?;
-        Ok(Self(res))
+        Ok(Self(rd.read_bin()?))
     }
 }
 
-impl<TT> Factual<TT> for i8 {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for i8
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_sint(wr, *self as i64)?;
         Ok(())
@@ -500,8 +541,11 @@ impl<TT> Factual<TT> for i8 {
     }
 }
 
-impl<TT> Factual<TT> for i16 {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for i16
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_sint(wr, *self as i64)?;
         Ok(())
@@ -512,8 +556,11 @@ impl<TT> Factual<TT> for i16 {
     }
 }
 
-impl<TT> Factual<TT> for i32 {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for i32
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_sint(wr, *self as i64)?;
         Ok(())
@@ -524,8 +571,11 @@ impl<TT> Factual<TT> for i32 {
     }
 }
 
-impl<TT> Factual<TT> for i64 {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for i64
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_sint(wr, *self)?;
         Ok(())
     }
@@ -535,8 +585,11 @@ impl<TT> Factual<TT> for i64 {
     }
 }
 
-impl<TT> Factual<TT> for u8 {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for u8
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_uint(wr, *self as u64)?;
         Ok(())
@@ -547,8 +600,11 @@ impl<TT> Factual<TT> for u8 {
     }
 }
 
-impl<TT> Factual<TT> for u16 {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for u16
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_uint(wr, *self as u64)?;
         Ok(())
@@ -559,8 +615,11 @@ impl<TT> Factual<TT> for u16 {
     }
 }
 
-impl<TT> Factual<TT> for u32 {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for u32
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         #[allow(clippy::cast_lossless)]
         rmp::encode::write_uint(wr, *self as u64)?;
         Ok(())
@@ -571,8 +630,11 @@ impl<TT> Factual<TT> for u32 {
     }
 }
 
-impl<TT> Factual<TT> for u64 {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for u64
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_uint(wr, *self)?;
         Ok(())
     }
@@ -582,8 +644,11 @@ impl<TT> Factual<TT> for u64 {
     }
 }
 
-impl<TT> Factual<TT> for bool {
-    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+impl<M> Factual<M> for bool
+where
+    M: Mapping,
+{
+    fn write<W: Write>(&self, _mapping: &M, wr: &mut W) -> Result<(), Error> {
         rmp::encode::write_bool(wr, *self)?;
         Ok(())
     }
@@ -593,21 +658,25 @@ impl<TT> Factual<TT> for bool {
     }
 }
 
-pub fn write<TT, T, W>(t: &T, tt: &TT, wr: &mut W) -> Result<(), Error>
+pub fn write<M, T, W>(t: &T, mapping: &M, wr: &mut W) -> Result<(), Error>
 where
-    T: Factual<TT>,
+    T: Factual<M>,
     W: Write,
+    M: Mapping,
 {
-    t.write(tt, wr)
+    t.write(mapping, wr)
 }
 
-pub fn read<TT, T, R>(rd: &mut Reader<R>) -> Result<T, Error>
+pub fn read<M, T, R>(rd: &mut Reader<R>) -> Result<T, Error>
 where
-    T: Factual<TT>,
+    T: Factual<M>,
     R: Read,
+    M: Mapping,
 {
     T::read(rd)
 }
+
+impl Mapping for () {}
 
 pub fn read_simple<T, R>(rd: &mut Reader<R>) -> Result<T, Error>
 where
@@ -705,7 +774,7 @@ pub enum BaseType {
 
 #[cfg(test)]
 mod tests {
-    use super::{Factual, Reader};
+    use super::{Factual, Mapping, Reader};
     use netbuf::Buf;
     use std::cmp::PartialEq;
     use std::collections::HashMap;
@@ -839,12 +908,13 @@ mod tests {
         cycle((), l)
     }
 
-    fn cycle<T, TT>(tt: TT, l: T) -> Result<(), Box<std::error::Error>>
+    fn cycle<T, M>(mapping: M, l: T) -> Result<(), Box<std::error::Error>>
     where
-        T: Factual<TT> + Debug + PartialEq,
+        T: Factual<M> + Debug + PartialEq,
+        M: Mapping,
     {
         let mut buf = Buf::new();
-        l.write(&tt, &mut buf)?;
+        l.write(&mapping, &mut buf)?;
         let mut slice = &buf[..];
         let r: T = super::read(&mut Reader::new(&mut slice))?;
         assert_eq!(l, r);

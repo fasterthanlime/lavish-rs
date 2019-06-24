@@ -1,275 +1,153 @@
-use serde::{de::*, ser::*};
-use std::marker::{PhantomData, Send};
-use std::{fmt, fmt::Debug};
+use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::marker::Send;
 
-pub use erased_serde;
-pub use serde;
-pub use serde_derive;
+use super::facts::{self, Mapping};
 
 pub trait PendingRequests {
     fn get_pending(&self, id: u32) -> Option<&'static str>;
 }
 
-pub trait Atom: serde::Serialize + Debug + Sized + Send + 'static {
+pub trait Atom<M>: facts::Factual<M> + Debug + Sized + Send + 'static
+where
+    M: Mapping,
+{
     fn method(&self) -> &'static str;
-    fn deserialize(method: &str, de: &mut erased_serde::Deserializer)
-        -> erased_serde::Result<Self>;
-}
-
-struct AtomApply<T: ?Sized>
-where
-    T: Atom,
-{
-    pub kind: String,
-    pub phantom: PhantomData<T>,
-}
-
-impl<'de, T: ?Sized> DeserializeSeed<'de> for AtomApply<T>
-where
-    T: Atom,
-{
-    type Value = T;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let mut erased = erased_serde::Deserializer::erase(deserializer);
-        T::deserialize(&self.kind, &mut erased).map_err(serde::de::Error::custom)
-    }
-}
-
-struct AtomOptionApply<T: ?Sized>
-where
-    T: Atom,
-{
-    pub kind: String,
-    pub phantom: PhantomData<T>,
-}
-
-impl<'de, T: ?Sized> DeserializeSeed<'de> for AtomOptionApply<T>
-where
-    T: Atom,
-{
-    type Value = Option<T>;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_option(AtomOptionVisitor {
-            kind: self.kind,
-            phantom: PhantomData,
-        })
-    }
-}
-
-struct AtomOptionVisitor<T: ?Sized>
-where
-    T: Atom,
-{
-    pub kind: String,
-    pub phantom: PhantomData<T>,
-}
-
-impl<'de, T: ?Sized> Visitor<'de> for AtomOptionVisitor<T>
-where
-    T: Atom,
-{
-    type Value = Option<T>;
-
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "a nullable msgpack-RPC payload (results, params, etc.)")
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let mut erased = erased_serde::Deserializer::erase(deserializer);
-        T::deserialize(&self.kind, &mut erased)
-            .map(Some)
-            .map_err(serde::de::Error::custom)
-    }
 }
 
 #[derive(Debug)]
-pub enum Message<P, NP, R>
+pub enum Message<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     Request {
         id: u32,
         params: P,
+        phantom: PhantomData<M>,
     },
     Response {
         id: u32,
         error: Option<String>,
         results: Option<R>,
+        phantom: PhantomData<M>,
     },
     Notification {
         params: NP,
+        phantom: PhantomData<M>,
     },
 }
 
-impl<P, NP, R> Message<P, NP, R>
+impl<M, P, NP, R> Message<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
     pub fn request(id: u32, params: P) -> Self {
-        Message::<P, NP, R>::Request { id, params }
+        Message::<M, P, NP, R>::Request {
+            id,
+            params,
+            phantom: PhantomData,
+        }
     }
 
     pub fn notification(params: NP) -> Self {
-        Message::<P, NP, R>::Notification { params }
+        Message::<M, P, NP, R>::Notification {
+            params,
+            phantom: PhantomData,
+        }
     }
 
     pub fn response(id: u32, error: Option<String>, results: Option<R>) -> Self {
-        Message::<P, NP, R>::Response { id, error, results }
-    }
-}
-
-impl<P, NP, R> Serialize for Message<P, NP, R>
-where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
-{
-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Message::Request { id, params, .. } => {
-                let mut seq = s.serialize_seq(Some(4))?;
-                seq.serialize_element(&0)?;
-                seq.serialize_element(&id)?;
-                seq.serialize_element(params.method())?;
-                seq.serialize_element(params)?;
-                seq.end()
-            }
-            Message::Response {
-                id, error, results, ..
-            } => {
-                let mut seq = s.serialize_seq(Some(4))?;
-                seq.serialize_element(&1)?;
-                seq.serialize_element(&id)?;
-                seq.serialize_element(&error)?;
-                seq.serialize_element(results)?;
-                seq.end()
-            }
-            Message::Notification { params, .. } => {
-                let mut seq = s.serialize_seq(Some(3))?;
-                seq.serialize_element(&2)?;
-                seq.serialize_element(params.method())?;
-                seq.serialize_element(params)?;
-                seq.end()
-            }
+        Message::<M, P, NP, R>::Response {
+            id,
+            error,
+            results,
+            phantom: PhantomData,
         }
     }
 }
 
-impl<P, NP, R> Message<P, NP, R>
-where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
-{
-    pub fn deserialize<'de, D>(d: D, pending: &'de dyn PendingRequests) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        d.deserialize_seq(MessageVisitor::<'de, P, NP, R> {
-            pending,
-            phantom: PhantomData,
-        })
-    }
-}
+use std::io::{Read, Write};
 
-struct MessageVisitor<'de, P, NP, R>
+impl<M, P, NP, R> facts::Factual<M> for Message<M, P, NP, R>
 where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
 {
-    pending: &'de dyn PendingRequests,
-    phantom: PhantomData<(P, NP, R)>,
-}
-
-impl<'de, P, NP, R> Visitor<'de> for MessageVisitor<'de, P, NP, R>
-where
-    P: Atom,
-    NP: Atom,
-    R: Atom,
-{
-    type Value = Message<P, NP, R>;
-
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "a valid msgpack-RPC message (ie. a sequence)")
+    fn write<W: Write>(&self, mapping: &M, wr: &mut W) -> Result<(), facts::Error> {
+        match self {
+            Message::Request { id, params, .. } => {
+                rmp::encode::write_array_len(wr, 3)?;
+                0.write(mapping, wr)?;
+                id.write(mapping, wr)?;
+                params.write(mapping, wr)?;
+            }
+            Message::Response {
+                id, error, results, ..
+            } => {
+                rmp::encode::write_array_len(wr, 4)?;
+                1.write(mapping, wr)?;
+                id.write(mapping, wr)?;
+                error.write(mapping, wr)?;
+                results.write(mapping, wr)?;
+            }
+            Message::Notification { params, .. } => {
+                rmp::encode::write_array_len(wr, 2)?;
+                2.write(mapping, wr)?;
+                params.write(mapping, wr)?;
+            }
+        }
+        Ok(())
     }
 
-    fn visit_seq<S>(self, mut access: S) -> Result<Self::Value, S::Error>
+    fn read<Rd: Read>(rd: &mut facts::Reader<Rd>) -> Result<Self, facts::Error>
     where
-        S: SeqAccess<'de>,
+        Self: Sized,
     {
-        use serde::de::Error;
-        let missing = |field: &str| -> S::Error {
-            S::Error::custom(format!("invalid msgpack-RPC message: missing {}", field))
-        };
-
-        let typ = access
-            .next_element::<u32>()?
-            .ok_or_else(|| missing("type"))?;
-
+        let len = rd.read_array_len()?;
+        let typ: u32 = rd.read_int()?;
         match typ {
-            // Request
             0 => {
-                let id = access.next_element::<u32>()?.ok_or_else(|| missing("id"))?;
-                let method = access
-                    .next_element::<String>()?
-                    .ok_or_else(|| missing("method"))?;
-
-                let seed = AtomApply::<P> {
-                    kind: method,
-                    phantom: std::marker::PhantomData,
-                };
-                let params = access
-                    .next_element_seed(seed)?
-                    .ok_or_else(|| missing("params"))?;
-
-                Ok(Message::Request { id, params })
+                // Request
+                if len != 3 {
+                    unreachable!()
+                }
+                Ok(Message::Request {
+                    id: Self::subread(rd)?,
+                    params: Self::subread(rd)?,
+                    phantom: PhantomData,
+                })
             }
-            // Response
             1 => {
-                let id = access.next_element::<u32>()?.ok_or_else(|| missing("id"))?;
-                let error = access
-                    .next_element::<Option<String>>()?
-                    .ok_or_else(|| missing("error"))?;
-
-                let method = self
-                    .pending
-                    .get_pending(id)
-                    .ok_or_else(|| missing("no such pending request"))?;
-
-                let seed = AtomOptionApply::<R> {
-                    kind: method.into(),
-                    phantom: std::marker::PhantomData,
-                };
-                let results = access
-                    .next_element_seed(seed)?
-                    .ok_or_else(|| missing("results"))?;
-
-                Ok(Message::Response { id, error, results })
+                // Response
+                if len != 4 {
+                    unreachable!()
+                }
+                Ok(Message::Response {
+                    id: Self::subread(rd)?,
+                    error: Self::subread(rd)?,
+                    results: Self::subread(rd)?,
+                    phantom: PhantomData,
+                })
             }
-            _ => unimplemented!(),
+            2 => {
+                // Notification
+                if len != 2 {
+                    unreachable!()
+                }
+                Ok(Message::Notification {
+                    params: Self::subread(rd)?,
+                    phantom: PhantomData,
+                })
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -277,48 +155,104 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_derive::*;
+    use facts::Factual;
 
-    #[derive(Serialize, Debug)]
-    #[serde(untagged)]
+    #[derive(Debug, Default)]
+    pub struct M {}
+
+    impl facts::Mapping for M {}
+
+    #[derive(Debug)]
     enum Test {
         Foo(TestFoo),
         Bar(TestBar),
     }
 
-    #[derive(Serialize, Deserialize, Debug)]
+    impl facts::Factual<M> for Test {
+        fn write<W: Write>(&self, mapping: &M, wr: &mut W) -> Result<(), facts::Error> {
+            rmp::encode::write_array_len(wr, 2)?;
+            match self {
+                Test::Foo(v) => {
+                    0.write(mapping, wr)?;
+                    v.write(mapping, wr)?;
+                }
+                Test::Bar(v) => {
+                    1.write(mapping, wr)?;
+                    v.write(mapping, wr)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn read<R: Read>(rd: &mut facts::Reader<R>) -> Result<Self, facts::Error>
+        where
+            Self: Sized,
+        {
+            let len = rd.read_array_len()?;
+            if len != 2 {
+                unreachable!()
+            }
+
+            let discriminant: u32 = rd.read_int()?;
+            Ok(match discriminant {
+                0 => Test::Foo(Self::subread(rd)?),
+                1 => Test::Bar(Self::subread(rd)?),
+                _ => unreachable!(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
     struct TestFoo {
         val: i64,
     }
 
-    #[derive(Serialize, Deserialize, Debug)]
-    struct TestBar {
-        val: String,
-        #[serde(with = "serde_bytes")]
-        bs: Vec<u8>,
+    impl facts::Factual<M> for TestFoo {
+        fn write<W: Write>(&self, mapping: &M, wr: &mut W) -> Result<(), facts::Error> {
+            self.val.write(mapping, wr)
+        }
+
+        fn read<R: Read>(rd: &mut facts::Reader<R>) -> Result<Self, facts::Error>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                val: Self::subread(rd)?,
+            })
+        }
     }
 
-    type Message = super::Message<Test, Test, Test>;
+    #[derive(Debug)]
+    struct TestBar {
+        val: String,
+        bs: facts::Bin,
+    }
 
-    impl Atom for Test {
+    impl facts::Factual<M> for TestBar {
+        fn write<W: Write>(&self, mapping: &M, wr: &mut W) -> Result<(), facts::Error> {
+            self.val.write(mapping, wr)?;
+            self.bs.write(mapping, wr)?;
+            Ok(())
+        }
+
+        fn read<R: Read>(rd: &mut facts::Reader<R>) -> Result<Self, facts::Error>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                val: Self::subread(rd)?,
+                bs: Self::subread(rd)?,
+            })
+        }
+    }
+
+    type Message = super::Message<M, Test, Test, Test>;
+
+    impl Atom<M> for Test {
         fn method(&self) -> &'static str {
             match self {
                 Test::Foo(_) => "Foo",
                 Test::Bar(_) => "Bar",
-            }
-        }
-
-        fn deserialize(
-            method: &str,
-            de: &mut erased_serde::Deserializer,
-        ) -> erased_serde::Result<Self> {
-            match method {
-                "Foo" => Ok(Test::Foo(erased_serde::deserialize::<TestFoo>(de)?)),
-                "Bar" => Ok(Test::Bar(erased_serde::deserialize::<TestBar>(de)?)),
-                _ => Err(erased_serde::Error::custom(format!(
-                    "unknown method: {}",
-                    method
-                ))),
             }
         }
     }
@@ -330,35 +264,24 @@ mod tests {
             420,
             Test::Bar(TestBar {
                 val: "success!".into(),
-                bs: vec![0x0, 0x15, 0x93],
+                bs: vec![0x0, 0x15, 0x93].into(),
             }),
         ));
     }
 
     fn cycle(m1: Message) {
+        let mapping = M {};
         println!("m1 = {:#?}", m1);
 
         let mut buf1: Vec<u8> = Vec::new();
-        m1.serialize(&mut rmp_serde::Serializer::new_named(&mut buf1))
-            .unwrap();
+        m1.write(&mapping, &mut buf1).unwrap();
 
-        let pr = TestPendingRequests {};
-        let m2: Message =
-            Message::deserialize(&mut rmp_serde::Deserializer::from_slice(&buf1[..]), &pr).unwrap();
+        let m2: Message = Message::read(&mut facts::Reader::new(&mut &buf1[..])).unwrap();
         println!("m2 = {:#?}", m2);
 
         let mut buf2: Vec<u8> = Vec::new();
-        m2.serialize(&mut rmp_serde::Serializer::new_named(&mut buf2))
-            .unwrap();
+        m2.write(&mapping, &mut buf2).unwrap();
 
         assert_eq!(buf1, buf2);
-    }
-
-    struct TestPendingRequests {}
-
-    impl PendingRequests for TestPendingRequests {
-        fn get_pending(&self, _id: u32) -> Option<&'static str> {
-            None
-        }
     }
 }
