@@ -20,7 +20,10 @@ use num_traits::cast::FromPrimitive;
 #[derive(Debug)]
 pub enum Error {
     IO(std::io::Error),
-    InvalidStructLength { expected: usize, actual: usize },
+    InvalidStructLength {
+        expected: usize,
+        actual: usize,
+    },
     IncompatibleSchema(String),
     DecodeStringError(),
     ValueWriteError(ValueWriteError),
@@ -29,6 +32,10 @@ pub enum Error {
     MarkerReadError(MarkerReadError),
     WrongExtForTimestamp(i8),
     WrongLenForTimestamp(u8),
+    UnwrittableUnionVariant {
+        union: &'static str,
+        variant: &'static str,
+    },
 }
 
 impl From<std::io::Error> for Error {
@@ -734,6 +741,32 @@ impl TypeMapping {
         }
 
         Ok(())
+    }
+
+    pub fn write_union<W, M, T>(
+        &self,
+        wr: &mut W,
+        mapping: &M,
+        union: &'static str,
+        variant: &'static str,
+        index: usize,
+        value: T,
+    ) -> Result<(), Error>
+    where
+        T: Factual<M>,
+        M: Mapping,
+        W: Write,
+    {
+        let offsets = self.validate()?;
+        rmp::encode::write_array_len(wr, 2)?;
+        match offsets.get(index) {
+            Some(offset) => {
+                offset.write(mapping, wr)?;
+                value.write(mapping, wr)?;
+                Ok(())
+            }
+            None => Err(Error::UnwrittableUnionVariant { union, variant }),
+        }
     }
 }
 
