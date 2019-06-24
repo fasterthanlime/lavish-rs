@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::Sized;
 
+use byteorder::{self, ReadBytesExt, WriteBytesExt};
+
 use std::io::{Read, Write};
 
 use rmp::decode::{DecodeStringError, MarkerReadError, NumValueReadError, ValueReadError};
@@ -24,6 +26,8 @@ pub enum Error {
     ValueReadError(ValueReadError),
     NumValueReadError(NumValueReadError),
     MarkerReadError(MarkerReadError),
+    WrongExtForTimestamp(i8),
+    WrongLenForTimestamp(u8),
 }
 
 impl From<std::io::Error> for Error {
@@ -297,6 +301,103 @@ impl<TT> Factual<TT> for String {
         let bytes = rd.read_slice(len)?;
         let res = std::str::from_utf8(bytes)?.to_string();
         Ok(res)
+    }
+}
+
+impl<TT> Factual<TT> for chrono::DateTime<chrono::offset::Utc> {
+    fn write<W: Write>(&self, _tt: &TT, wr: &mut W) -> Result<(), Error> {
+        // see https://github.com/msgpack/msgpack/blob/master/spec.md#timestamp-extension-type
+
+        let tv_sec: i64 = self.timestamp();
+        let tv_nsec: u32 = self.timestamp_subsec_nanos();
+
+        if tv_sec >> 34 == 0 {
+            #[allow(clippy::cast_lossless)]
+            let data64: u64 = ((tv_nsec as u64) << 34) | tv_sec as u64;
+            if data64 & 0xFFFF_FFFF_0000_0000 == 0 {
+                // timestamp 32
+                let data32 = data64 as u32;
+                wr.write_u8(Marker::FixExt4.to_u8())?;
+                wr.write_i8(-1)?;
+                wr.write_u32::<byteorder::BigEndian>(data32)?;
+            } else {
+                // timestamp 64
+                wr.write_u8(Marker::FixExt8.to_u8())?;
+                wr.write_i8(-1)?;
+                wr.write_u64::<byteorder::BigEndian>(data64)?;
+            }
+        } else {
+            // timestamp 96
+            // note: Ext8 is followed by 1 byte that specifies the data length
+            // and our data length is 4 + 8 = 12. (nanos as a 32-bit uint,
+            // seconds as a 64-bit signed int)
+            wr.write_u8(Marker::Ext8.to_u8())?;
+            wr.write_u8(12)?;
+            wr.write_i8(-1)?;
+            wr.write_u32::<byteorder::BigEndian>(tv_nsec)?;
+            wr.write_i64::<byteorder::BigEndian>(tv_sec)?;
+        }
+
+        Ok(())
+    }
+
+    fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
+        // see https://github.com/msgpack/msgpack/blob/master/spec.md#timestamp-extension-type
+
+        let marker = rd.fetch_marker()?;
+        match marker {
+            Marker::FixExt4 => {
+                let typ = rd.read_i8()?;
+                if typ != -1 {
+                    return Err(Error::WrongExtForTimestamp(typ));
+                }
+
+                let data32 = rd.read_u32::<byteorder::BigEndian>()?;
+                #[allow(clippy::cast_lossless)]
+                let naive = chrono::NaiveDateTime::from_timestamp(data32 as i64, 0);
+                Ok(chrono::DateTime::<chrono::offset::Utc>::from_utc(
+                    naive,
+                    chrono::offset::Utc,
+                ))
+            }
+            Marker::FixExt8 => {
+                let typ = rd.read_i8()?;
+                if typ != -1 {
+                    return Err(Error::WrongExtForTimestamp(typ));
+                }
+
+                let data64 = rd.read_u64::<byteorder::BigEndian>()?;
+                let tv_nsec = data64 >> 34;
+                let tv_sec = data64 & 0x0000_0003_FFFF_FFFF;
+
+                #[allow(clippy::cast_lossless)]
+                let naive = chrono::NaiveDateTime::from_timestamp(tv_sec as i64, tv_nsec as u32);
+                Ok(chrono::DateTime::<chrono::offset::Utc>::from_utc(
+                    naive,
+                    chrono::offset::Utc,
+                ))
+            }
+            Marker::Ext8 => {
+                let len = rd.read_u8()?;
+                if len != 12 {
+                    return Err(Error::WrongLenForTimestamp(len));
+                }
+
+                let typ = rd.read_i8()?;
+                if typ != -1 {
+                    return Err(Error::WrongExtForTimestamp(typ));
+                }
+
+                let tv_nsec = rd.read_u32::<byteorder::BigEndian>()?;
+                let tv_sec = rd.read_i64::<byteorder::BigEndian>()?;
+                let naive = chrono::NaiveDateTime::from_timestamp(tv_sec, tv_nsec);
+                Ok(chrono::DateTime::<chrono::offset::Utc>::from_utc(
+                    naive,
+                    chrono::offset::Utc,
+                ))
+            }
+            _ => Err(ValueReadError::TypeMismatch(marker).into()),
+        }
     }
 }
 
@@ -638,6 +739,51 @@ mod tests {
         cycle_simple("".to_string())?;
         cycle_simple("dull".repeat(128).to_string())?;
         cycle_simple("dull".repeat(1024).to_string())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn timestamps() -> Result<(), Box<std::error::Error>> {
+        fn cycle_timestamp(
+            secs: i64,
+            nsecs: u32,
+            marker_expected: rmp::Marker,
+        ) -> Result<(), Box<std::error::Error>> {
+            let v = chrono::NaiveDateTime::from_timestamp(secs, nsecs);
+            let v = chrono::DateTime::<chrono::offset::Utc>::from_utc(v, chrono::offset::Utc);
+            cycle_simple(v.clone())?;
+
+            let mut buf = Buf::new();
+            v.write(&(), &mut buf)?;
+            let mut slice = &buf[..];
+            let marker_actual = rmp::decode::read_marker(&mut slice).unwrap();
+            assert_eq!(marker_expected, marker_actual);
+
+            Ok(())
+        }
+
+        cycle_simple(chrono::offset::Utc::now())?;
+
+        // epoch
+        cycle_timestamp(0, 0, rmp::Marker::FixExt4)?;
+        // time at the writing of this test
+        cycle_timestamp(1561378047, 0, rmp::Marker::FixExt4)?;
+
+        // time at the writing of this test, with some nanoseconds
+        cycle_timestamp(1561378047, 2398, rmp::Marker::FixExt8)?;
+
+        // some time in the future (year 2200), no nanoseconds
+        cycle_timestamp(7273195896, 0, rmp::Marker::FixExt8)?;
+
+        // some time in the future (year 2200), with nanoseconds
+        cycle_timestamp(7273195896, 23549, rmp::Marker::FixExt8)?;
+
+        // time of moon landing (before epoch)
+        cycle_timestamp(-14182980, 0, rmp::Marker::Ext8)?;
+
+        // some time far into the future (year 2600 - amos's 610th birthday)
+        cycle_timestamp(19898323200, 0, rmp::Marker::Ext8)?;
 
         Ok(())
     }
