@@ -700,14 +700,14 @@ impl OffsetList {
     }
 }
 
-pub enum TranslationTable {
+pub enum TypeMapping {
     Mapped(OffsetList),
     Incompatible(String),
 }
 
-impl TranslationTable {
+impl TypeMapping {
     pub fn validate(&self) -> Result<&OffsetList, Error> {
-        use TranslationTable::*;
+        use TypeMapping::*;
 
         match self {
             Mapped(list) => Ok(&list),
