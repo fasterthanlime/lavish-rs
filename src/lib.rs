@@ -12,3 +12,4 @@ pub use error::*;
 pub mod facts;
 
 pub use chrono;
+pub use rmp;
