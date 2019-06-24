@@ -360,7 +360,7 @@ where
     }
 
     fn read<R: Read>(rd: &mut Reader<R>) -> Result<Self, Error> {
-        let len = rd.read_array_len()?;
+        let len = rd.read_map_len()?;
 
         let mut res = Self::new();
         for _ in 0..len {
@@ -370,6 +370,7 @@ where
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub struct Bin(Vec<u8>);
 
 impl<TT> Factual<TT> for Bin {
@@ -517,13 +518,25 @@ where
 
 pub struct OffsetList(pub Vec<i32>);
 
+impl OffsetList {
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<u32> {
+        let i = self.0[index];
+        if i < 0 {
+            None
+        } else {
+            Some(i as u32)
+        }
+    }
+}
+
 pub enum TranslationTable {
     Mapped(OffsetList),
     Incompatible(String),
 }
 
 impl TranslationTable {
-    fn validate(&self) -> Result<&OffsetList, Error> {
+    pub fn validate(&self) -> Result<&OffsetList, Error> {
         use TranslationTable::*;
 
         match self {
@@ -593,18 +606,99 @@ pub enum BaseType {
 mod tests {
     use super::{Factual, Reader};
     use netbuf::Buf;
+    use std::cmp::PartialEq;
+    use std::collections::HashMap;
+    use std::fmt::Debug;
 
     #[test]
-    fn base_types() -> Result<(), Box<std::error::Error>> {
-        let l: i32 = 24;
-        let mut buf = Buf::new();
-        l.write(&(), &mut buf)?;
-        let mut slice = &buf[..];
-        let r: i32 = super::read_simple(&mut Reader::new(&mut slice))?;
+    fn numbers() -> Result<(), Box<std::error::Error>> {
+        cycle_simple(2i8.pow(6))?;
+        cycle_simple(2i16.pow(14))?;
+        cycle_simple(2i32.pow(30))?;
+        cycle_simple(2i64.pow(62))?;
 
-        assert_eq!(l, r);
+        cycle_simple(2u8.pow(7))?;
+        cycle_simple(2u16.pow(15))?;
+        cycle_simple(2u32.pow(31))?;
+        cycle_simple(2u64.pow(63))?;
 
         Ok(())
     }
-}
 
+    #[test]
+    fn bools() -> Result<(), Box<std::error::Error>> {
+        cycle_simple(true)?;
+        cycle_simple(false)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn strings() -> Result<(), Box<std::error::Error>> {
+        cycle_simple("".to_string())?;
+        cycle_simple("dull".repeat(128).to_string())?;
+        cycle_simple("dull".repeat(1024).to_string())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn arrays() -> Result<(), Box<std::error::Error>> {
+        let strings = vec!["foo".to_string(), "bar".to_string(), "dull".repeat(128)];
+        cycle_simple(strings)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn maps() -> Result<(), Box<std::error::Error>> {
+        let mut map = HashMap::<String, i32>::new();
+        cycle_simple(map.clone())?;
+
+        map.insert("ten".into(), 10);
+        map.insert("twenty eight".into(), 28);
+        map.insert("one hundred and thirty nine".into(), 139);
+        cycle_simple(map.clone())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn bins() -> Result<(), Box<std::error::Error>> {
+        let bin: Vec<u8> = vec![];
+        cycle_simple(super::Bin(bin))?;
+
+        let bin: Vec<u8> = vec![6, 123, 92, 32, 41, 0, 14, 28, 255];
+        cycle_simple(super::Bin(bin))?;
+
+        let mut bin: Vec<u8> = Vec::new();
+        for _ in 0..1024 {
+            bin.push(6);
+            bin.push(92);
+            bin.push(0);
+            bin.push(32);
+        }
+        cycle_simple(super::Bin(bin))?;
+
+        Ok(())
+    }
+
+    fn cycle_simple<T>(l: T) -> Result<(), Box<std::error::Error>>
+    where
+        T: Factual<()> + Debug + PartialEq,
+    {
+        cycle((), l)
+    }
+
+    fn cycle<T, TT>(tt: TT, l: T) -> Result<(), Box<std::error::Error>>
+    where
+        T: Factual<TT> + Debug + PartialEq,
+    {
+        let mut buf = Buf::new();
+        l.write(&tt, &mut buf)?;
+        let mut slice = &buf[..];
+        let r: T = super::read(&mut Reader::new(&mut slice))?;
+        assert_eq!(l, r);
+        Ok(())
+    }
+}
