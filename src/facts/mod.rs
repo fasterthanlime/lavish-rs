@@ -504,7 +504,7 @@ where
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Bin(pub Vec<u8>);
 
 impl From<Vec<u8>> for Bin {
