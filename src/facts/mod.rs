@@ -750,7 +750,7 @@ impl TypeMapping {
         union: &'static str,
         variant: &'static str,
         index: usize,
-        value: T,
+        value: &T,
     ) -> Result<(), Error>
     where
         T: Factual<M>,
