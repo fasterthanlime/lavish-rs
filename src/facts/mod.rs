@@ -519,6 +519,28 @@ impl AsRef<[u8]> for Bin {
     }
 }
 
+impl std::ops::Deref for Bin {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        (&self.0 as &std::ops::Deref<Target = [u8]>).deref()
+    }
+}
+
+use std::ops::Index;
+use std::slice::SliceIndex;
+impl<I> Index<I> for Bin
+where
+    I: SliceIndex<[u8]>,
+{
+    type Output = I::Output;
+
+    #[inline]
+    fn index(&self, index: I) -> &Self::Output {
+        Index::index(&**self, index)
+    }
+}
+
 impl<M> Factual<M> for Bin
 where
     M: Mapping,
@@ -931,6 +953,9 @@ mod tests {
             bin.push(0);
             bin.push(32);
         }
+        assert_eq!(92, bin[1]);
+        bin[1] = 93;
+        assert_eq!(&[6, 93], &bin[0..2]);
         cycle_simple(super::Bin(bin))?;
 
         Ok(())
