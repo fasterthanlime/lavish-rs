@@ -255,19 +255,25 @@ where
     let join_handle = std::thread::spawn(move || {
         let mut conn_number = 0;
         let mut incoming = listener.incoming();
+        let mut runtimes = Vec::<Runtime<CL>>::new();
+
         while let Some(conn) = incoming.next() {
             let conn = conn.unwrap();
             conn.set_nodelay(true).unwrap();
             let handler = handler.clone();
             // oh poor rustc you needed a little push there
-            spawn::<M, CL, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap();
+            runtimes.push(spawn::<M, CL, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap());
 
             conn_number += 1;
             if let Some(max_conns) = max_conns {
                 if conn_number >= max_conns {
-                    return;
+                    break;
                 }
             }
+        }
+
+        for mut r in runtimes.drain(..) {
+            r.join().unwrap();
         }
     });
     Ok(Server {
