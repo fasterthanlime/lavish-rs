@@ -279,10 +279,13 @@ where
             conn.set_nodelay(true).unwrap();
             let handler = handler.clone();
             // oh poor rustc you needed a little push there
-            runtimes.push(spawn::<CL, M, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap());
+            let runtime = spawn::<CL, M, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap();
 
             conn_number += 1;
             if let Some(max_conns) = max_conns {
+                // only collect runtimes if we have a maximum number of
+                // connections - otherwise, it'd just grow unbounded.
+                runtimes.push(runtime);
                 if conn_number >= max_conns {
                     break;
                 }
