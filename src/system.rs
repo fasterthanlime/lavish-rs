@@ -62,9 +62,22 @@ where
     R: Atom<M>,
     M: Mapping,
 {
-    conn_ref: Arc<ConnRef>,
+    conn_ref: Option<Arc<ConnRef>>,
+    shutdown_handle: Box<Conn>,
     queue: Arc<Mutex<Queue<M, P, NP, R>>>,
     sink: mpsc::Sender<SinkValue<M, P, NP, R>>,
+}
+
+impl<M, P, NP, R> Drop for Caller<M, P, NP, R>
+where
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    M: Mapping,
+{
+    fn drop(&mut self) {
+        debug!("Caller: dropping!");
+    }
 }
 
 impl<M, P, NP, R> Clone for Caller<M, P, NP, R>
@@ -79,6 +92,7 @@ where
             conn_ref: self.conn_ref.clone(),
             queue: self.queue.clone(),
             sink: self.sink.clone(),
+            shutdown_handle: self.shutdown_handle.try_clone().unwrap(),
         }
     }
 }
@@ -140,7 +154,7 @@ where
     }
 
     pub fn shutdown_runtime(&self) {
-        self.conn_ref.shutdown();
+        self.shutdown_handle.shutdown(Shutdown::Both).ok();
     }
 }
 
@@ -150,7 +164,10 @@ pub fn default_timeout() -> Duration {
 
 // Connect to an address over TCP, then spawn a new RPC
 // system with the given handler.
-pub fn connect<M, AH, A, H, CL, P, NP, R>(handler: AH, addr: A) -> Result<Runtime<CL>, Error>
+pub fn connect<M, AH, A, H, CL, P, NP, R>(
+    handler: AH,
+    addr: A,
+) -> Result<Runtime<CL, H, M, P, NP, R>, Error>
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
@@ -168,7 +185,7 @@ pub fn connect_timeout<M, AH, A, H, CL, P, NP, R>(
     handler: AH,
     addr: A,
     timeout: Option<Duration>,
-) -> Result<Runtime<CL>, Error>
+) -> Result<Runtime<CL, H, M, P, NP, R>, Error>
 where
     AH: Into<Arc<H>>,
     A: ToSocketAddrs,
@@ -255,14 +272,14 @@ where
     let join_handle = std::thread::spawn(move || {
         let mut conn_number = 0;
         let mut incoming = listener.incoming();
-        let mut runtimes = Vec::<Runtime<CL>>::new();
+        let mut runtimes = Vec::<Runtime<CL, H, M, P, NP, R>>::new();
 
         while let Some(conn) = incoming.next() {
             let conn = conn.unwrap();
             conn.set_nodelay(true).unwrap();
             let handler = handler.clone();
             // oh poor rustc you needed a little push there
-            runtimes.push(spawn::<M, CL, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap());
+            runtimes.push(spawn::<CL, M, Arc<H>, H, P, NP, R>(handler, Box::new(conn)).unwrap());
 
             conn_number += 1;
             if let Some(max_conns) = max_conns {
@@ -282,19 +299,30 @@ where
     })
 }
 
-pub struct Runtime<CL>
+pub struct Runtime<CL, H, M, P, NP, R>
 where
     CL: Clone,
+    M: Mapping,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    H: Handler<CL, M, P, NP, R> + 'static,
 {
-    client_template: CL,
+    caller: Caller<M, P, NP, R>,
     encode_handle: Option<JoinHandle<()>>,
     decode_handle: Option<JoinHandle<()>>,
     shutdown_handle: Box<Conn>,
+    phantom: PhantomData<(CL, H)>,
 }
 
-impl<CL> Runtime<CL>
+impl<CL, H, M, P, NP, R> Runtime<CL, H, M, P, NP, R>
 where
     CL: Clone,
+    M: Mapping,
+    P: Atom<M>,
+    NP: Atom<M>,
+    R: Atom<M>,
+    H: Handler<CL, M, P, NP, R> + 'static,
 {
     pub fn join(&mut self) -> Result<(), Box<dyn Any + Send>> {
         if let Some(h) = self.encode_handle.take() {
@@ -307,7 +335,7 @@ where
     }
 
     pub fn client(&self) -> CL {
-        self.client_template.clone()
+        H::make_client(self.caller.clone())
     }
 
     pub fn shutdown(&self) {
@@ -333,7 +361,10 @@ impl Drop for ConnRef {
     }
 }
 
-pub fn spawn<M, CL, AH, H, P, NP, R>(handler: AH, conn: Box<Conn>) -> Result<Runtime<CL>, Error>
+pub fn spawn<CL, M, AH, H, P, NP, R>(
+    handler: AH,
+    conn: Box<Conn>,
+) -> Result<Runtime<CL, H, M, P, NP, R>, Error>
 where
     CL: Clone,
     AH: Into<Arc<H>>,
@@ -360,13 +391,19 @@ where
     let (tx, rx) = mpsc::channel();
     let runtime_tx = tx.clone();
 
-    let caller = Caller::<M, P, NP, R> {
-        conn_ref: conn_ref.clone(),
+    let runtime_caller = Caller::<M, P, NP, R> {
+        conn_ref: Some(conn_ref.clone()),
+        shutdown_handle: decode_shutdown_handle.try_clone()?,
         queue: queue.clone(),
-        sink: tx,
+        sink: tx.clone(),
     };
 
-    let client_template = H::make_client(caller.clone());
+    let internal_caller = Caller::<M, P, NP, R> {
+        conn_ref: None,
+        shutdown_handle: decode_shutdown_handle.try_clone()?,
+        queue: queue.clone(),
+        sink: tx.clone(),
+    };
 
     let encode_queue = queue.clone();
     let encode_handle = std::thread::spawn(move || {
@@ -421,7 +458,7 @@ where
                 Ok(res) => match res {
                     Some(message) => {
                         let handler = handler.clone();
-                        let caller = caller.clone();
+                        let caller = internal_caller.clone();
 
                         std::thread::spawn(move || {
                             let res = handle_message(message, handler, caller);
@@ -450,11 +487,13 @@ where
     });
 
     debug!("Spawned runtime!");
+
     Ok(Runtime {
-        client_template,
+        caller: runtime_caller,
         shutdown_handle,
         encode_handle: Some(encode_handle),
         decode_handle: Some(decode_handle),
+        phantom: PhantomData,
     })
 }
 
